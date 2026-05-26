@@ -1,0 +1,32 @@
+# Lima VM template used by test/run-lima.sh to exercise tusc.sh on Linux
+# from a macOS host. Ubuntu 24.04, with curl + bash preinstalled.
+#
+# The repo path under mounts[0].location is a placeholder and is replaced
+# by run-lima.sh with the absolute path of the host checkout before the
+# VM starts.
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 2
+memory: "2GiB"
+disk: "10GiB"
+
+mountType: "virtiofs"
+mounts:
+  - location: "__REPO_ROOT__"
+    mountPoint: "/repo"
+    writable: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        ca-certificates curl tar unzip bash gawk

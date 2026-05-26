@@ -21,10 +21,6 @@ If anything goes wrong, you can rerun the command to resume upload from where it
 ## Installation
 
 ```sh
-# Requirements:
-# jq
-sudo apt install jq -y
-
 curl -sSLo ~/tusc https://raw.githubusercontent.com/adhocore/tusc.sh/main/tusc.sh
 # for global binary
 chmod +x ~/tusc && sudo ln -s ~/tusc /usr/local/bin/tusc
@@ -32,18 +28,29 @@ chmod +x ~/tusc && sudo ln -s ~/tusc /usr/local/bin/tusc
 chmod +x ~/tusc && mv ~/tusc ~/.local/bin/tusc
 ```
 
+This fork runs on stock macOS using the system `/bin/bash` (3.2) — no
+Homebrew bash, no GNU coreutils, no `jq` required.
+
 ### System Requirements
 
+- `bash` ≥ 3.2 (macOS stock bash is fine)
+- `awk`
 - `base64`
 - `curl`
-- `dd`
-- `grep`
+- `grep`, `tr`
 - `mktemp`
-- `readlink`, `realpath`
-- `sha1sum`, `sha256sum`, `seq`, `sleep`
-- `tr`
+- `realpath` (macOS 12.3+ ships it in `/usr/bin`; Linux ships it in `coreutils`)
+- `shasum` (macOS) **or** `sha1sum`/`sha256sum` (Linux)
+- `stat`, `tail`, `seq`, `sleep`
 
 > Donot worry, in a typical UNIX flavored system these are likely to be there already.
+
+### Resume-state cache
+
+Resume state lives at `$TMPDIR/tusc.<uid>/` (override with the `TUSDIR`
+env var). It's keyed by sha1 of the file path + mtime so renaming or
+touching the file forces a re-hash, and one file per cache entry means
+nothing to parse or corrupt.
 
 
 ## Usage and Examples
@@ -148,8 +155,48 @@ ls -al ~/.tusd-data
 ```
 
 
+## Testing
+
+End-to-end tests live in `test/`. The runner downloads a `tusd`
+binary into `test/.cache/` (override with `TUSC_CACHE_DIR=...`),
+uploads a 5 MiB fixture, fetches it back, and compares SHA-256s.
+
+### Locally (macOS or Linux)
+
+```sh
+bash test/test.sh
+```
+
+### Linux from a macOS host, via Lima
+
+[Lima](https://github.com/lima-vm/lima) (`brew install lima`) spins up
+an Ubuntu 24.04 VM, installs `curl`/`tar`, mounts the repo read-only at
+`/repo`, and runs the test inside the VM.
+
+```sh
+bash test/run-lima.sh            # leave the VM running for repeat runs
+bash test/run-lima.sh --clean    # tear the VM down when done
+```
+
+The same `test/test.sh` runs in GitHub Actions on both
+`ubuntu-latest` and `macos-latest`.
+
 ### Contributors
 
 - [adhocore](https://github.com/adhocore) - **Lead Developer**
 - [tonk](https://github.com/tonk) - **Credential support**
 - Wouter van Hilst - **Chunked upload**
+- [Astera Institute](https://astera.org) - **macOS / bash 3.2 portability, removal of `jq` dependency, Lima-based test harness**
+
+### Tooling
+
+The macOS portability work, `jq` removal, and Lima-based test harness
+in this fork were drafted with the help of
+[Claude Code](https://claude.com/claude-code) (Anthropic) and reviewed
+by a human before landing.
+
+## License
+
+Released under the [MIT License](LICENSE). Original work © 2018
+Jitendra Adhikari; fork changes © 2026 Astera Institute. The original
+copyright notice is preserved in `LICENSE` as required.

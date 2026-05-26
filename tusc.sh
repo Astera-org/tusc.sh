@@ -5,19 +5,46 @@
 # Author:
 #   Jitendra Adhikari <jiten.adhikary@gmail.com>
 #
-# Be sure to check readme doc at https://github.com/adhocore/tusc.sh
+# Contributors:
+#   Astera Institute <https://astera.org>  (macOS portability, jq removal)
+#
+# Originally hosted at https://github.com/adhocore/tusc.sh
+#
+# Licensed under the MIT License. See the LICENSE file for details.
 #
 
 if [[ -f $HOME/.tus.dbg ]]; then set -ex; else set -e; fi
 
 FULL=$(readlink -f $0) TUSC=$(basename $0) SPINID=0 CURLARGS=
 
-declare -A HEADERS    # assoc headers of last request
-declare ISOK=0        # is last request ok?
+ISOK=0    # is last request ok?
+STATUS=   # last response status code
+
+# stat helpers (GNU vs BSD)
+if stat -c %s /dev/null >/dev/null 2>&1; then
+  fsize()  { stat -c %s "$1"; }
+  fmtime() { stat -c %Y "$1"; }
+else
+  fsize()  { stat -f %z "$1"; }
+  fmtime() { stat -f %m "$1"; }
+fi
+
+# unwrapped base64 (BSD base64 has no -w, GNU wraps at 76 by default)
+b64() { base64 | tr -d '\n'; }
+
+# ${algo}sum fallback to shasum (macOS ships shasum, not sha1sum/sha256sum)
+checksum() # $1 = algo (sha1|sha256|...), $2 = file -> prints "<hex>  <file>"
+{
+  if command -v "${1}sum" >/dev/null 2>&1; then
+    "${1}sum" "$2"
+  else
+    shasum -a "${1#sha}" "$2"
+  fi
+}
 
 # message helpers
 line() {
-  [[ $NOCOLOR ]] && echo -e "$1" || echo -e "\e[${3:-0};$2m$1\e[0m"
+  [[ $NOCOLOR ]] && printf '%b\n' "$1" || printf '\033[%s;%sm%b\033[0m\n' "${3:-0}" "$2" "$1"
   [[ "$4" == "" ]] || exit $4
 }
 error() { line "$1" 31 0 $2; }
@@ -77,36 +104,70 @@ usage()
 USAGE
 }
 
-# get/set tus config
-tus-config() # $1 = key, $2 = value
-{
-  TUSFILE="$HOME/.tus.json"
-  [[ -f $TUSFILE ]] || echo '{}' > $TUSFILE
-  TUSJSON=`cat $TUSFILE`
+# Resume-state cache: one file per key under $TMPDIR/tusc.<uid>/, keyed
+# by a sha1 of the logical key string so any characters (slashes,
+# colons, ...) are safe in filenames. Avoids depending on jq. The cache
+# lives under the system temp dir intentionally — resume survives the
+# duration of a session but the OS will reclaim it on reboot/cleanup.
+# Override with $TUSDIR for tests or single-user systems.
+if [[ -z "${TUSDIR:-}" ]]; then
+  TMP="${TMPDIR:-/tmp}"
+  TUSDIR="${TMP%/}/tusc.${UID:-$(id -u)}"
+fi
 
-  if [[ $# -eq 0 ]]; then
-    echo $TUSJSON
-  elif [[ $# -eq 1 ]]; then
-    echo $TUSJSON | jq -r "$1"
+# Hash an arbitrary string to a hex digest, for use as a filename.
+strhash() # $1 = string
+{
+  if command -v sha1sum >/dev/null 2>&1; then
+    printf %s "$1" | sha1sum | awk '{print $1}'
   else
-    echo $TUSJSON | jq "$1=\"$2\"" > $TUSFILE
+    printf %s "$1" | shasum -a 1 | awk '{print $1}'
   fi
+}
+
+# Cached file checksum (skip rehashing on resume).
+cache-checksum-get() # $1 = "<file>:<mtime>", $2 = algo
+{
+  local f="$TUSDIR/ck.$(strhash "$1").$2"
+  [[ -f "$f" ]] && cat "$f"
+  return 0
+}
+cache-checksum-set() # $1 = "<file>:<mtime>", $2 = algo, $3 = hex digest
+{
+  ensure-tusdir
+  printf %s "$3" > "$TUSDIR/ck.$(strhash "$1").$2"
+}
+
+# Cached resume URL for a (checksum-key, host) pair.
+cache-loc-get() # $1 = host, $2 = key
+{
+  local f="$TUSDIR/loc.$2.$(strhash "$1")"
+  [[ -f "$f" ]] && cat "$f"
+  return 0
+}
+cache-loc-set() # $1 = host, $2 = key, $3 = url
+{
+  ensure-tusdir
+  printf %s "$3" > "$TUSDIR/loc.$2.$(strhash "$1")"
+}
+
+ensure-tusdir()
+{
+  [[ -d "$TUSDIR" ]] && return 0
+  mkdir -p "$TUSDIR"
+  chmod 700 "$TUSDIR"
 }
 
 locate() # $1 = HOST, $2 = key
 {
-  loc=$(tus-config ".[\"$2\"].\"loc$1\"") lloc=""
-  [[ "$loc" == "null" ]] && lloc=$(tus-config ".[\"$2\"].location?") \
-    && [[ $lloc == *"$1/"* ]] && loc=$lloc && tus-config ".[\"$2\"].\"loc$1\"" "$loc"
-  echo $loc
+  cache-loc-get "$1" "$2"
 }
 
-# create a part of file
-filepart() # $1 = start_byte, $2 = byte_length, $3 = file
+# create a part of file (portable: BSD dd has no iflag=skip_bytes)
+filepart() # $1 = start_byte, $2 = byte_length (unused; always remainder), $3 = file
 {
-  dd bs=32M skip="$1" count="$2" iflag=skip_bytes ${3:+if="$3"} ${3:+of="$3.part"} > /dev/null 2>&1
-
-  echo `realpath $3.part`
+  tail -c +"$(( $1 + 1 ))" "$3" > "$3.part"
+  realpath "$3.part"
 }
 
 # http request
@@ -116,26 +177,31 @@ request()
   [[ $CREDS ]] && USERPASS="--basic --user '$USER:$PASS' "
   [[ $DEBUG ]] && comment "> curl ${USERPASS//:$PASS/}-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $1"
   [[ $DEBUG ]] && DBG="-v"
-  BODY=$(bash -c "curl $DBG $USERPASS-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $CURLARGS $1") HEADERS=()
+  BODY=$(bash -c "curl $DBG $USERPASS-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $CURLARGS $1")
 
-  while IFS=':' read key value; do
-    if [[ "${key:0:5}" == "HTTP/" ]]; then
-      value=$(echo "$key" | grep -Eo '[0-9]{3}') key=Status
-    fi
-    value="${value/ /}"  HEADERS[$key]="${value%$'\r'}"
-  done < <(cat "$HEADER")
-
-  if [[ "${HEADERS[Status]}" == "20"* ]]; then ISOK=1 RET=0; else ISOK=0 RET=1; fi
+  STATUS=$(awk '/^HTTP\// { match($0, /[0-9][0-9][0-9]/); s = substr($0,RSTART,3) } END { print s }' "$HEADER")
+  if [[ "$STATUS" == 20* ]]; then ISOK=1 RET=0; else ISOK=0 RET=1; fi
   if [[ $ISOK -eq 0 ]] && [[ "$1" != *"--head"* ]]; then error "$BODY" 1; fi
   return $RET
 }
 
-# http response header
+# http response header (case-insensitive lookup against the raw header file)
 header() # $1 = key
 {
-  val=${HEADERS[$1]} low=$(echo $1 | tr '[:upper:]' '[:lower:]')
-  [[ "" = "$val" ]] && val=${HEADERS[$low]}
-  echo $val
+  [[ -f "$HEADER" ]] || return 0
+  awk -v k="$1" '
+    BEGIN { k = tolower(k) }
+    /^HTTP\// { next }
+    {
+      sub(/\r$/, "")
+      i = index($0, ":")
+      if (i == 0) next
+      n = substr($0, 1, i - 1)
+      v = substr($0, i + 1)
+      sub(/^ +/, "", v)
+      if (tolower(n) == k) { print v; exit }
+    }
+  ' "$HEADER"
 }
 
 # show spinner and mark its pid
@@ -170,10 +236,12 @@ no-spinner()
 on-exit()
 {
   no-spinner
+  if [[ $OFFSET ]]; then
+    OFFSET=$(header "Upload-Offset")  LEFTOVER=$((SIZE - ${OFFSET:-0}))
+  fi
   rm -f $FILE.part $HEADER0 $HEADER
   [[ $OFFSET ]] || return 0
 
-  OFFSET=$(header "Upload-Offset")  LEFTOVER=$((SIZE - OFFSET))
   if [[ $LEFTOVER -eq 0 ]]; then
     ok "✔ Uploaded successfully!"
   else
@@ -214,25 +282,29 @@ trap on-exit EXIT
 SUMALGO=${SUMALGO:-sha1}
 [[ $SUMALGO == "sha"* ]] || error "--algo '$SUMALGO' not supported" 1
 
-FILE=`realpath $FILE`  NAME=`basename $FILE`  SIZE=`stat -c %s $FILE`  MTIME=`stat -c %Y $FILE`
+FILE=`realpath "$FILE"`  NAME=`basename "$FILE"`  SIZE=`fsize "$FILE"`  MTIME=`fmtime "$FILE"`
 HEADER=`mktemp -t tus.XXXXXXXXXX`
 
 # calc &/or cache key and checksum
-KEY=`tus-config ".[\"$FILE:$MTIME\"].$SUMALGO?"`
-[[ "null" == "$KEY" ]] && [[ $DEBUG ]] && comment "> ${SUMALGO}sum $FILE"
-[[ "null" == "$KEY" ]] && spinner && read -r KEY _ <<< `${SUMALGO}sum $FILE` && no-spinner
-tus-config ".[\"$FILE:$MTIME\"].$SUMALGO" "$KEY"
-CHKSUM="$SUMALGO $(echo -n $KEY | base64 -w 0)"
+KEY=$(cache-checksum-get "$FILE:$MTIME" "$SUMALGO")
+if [[ -z "$KEY" ]]; then
+  [[ $DEBUG ]] && comment "> checksum $SUMALGO $FILE"
+  spinner
+  read -r KEY _ <<< "$(checksum "$SUMALGO" "$FILE")"
+  no-spinner
+  cache-checksum-set "$FILE:$MTIME" "$SUMALGO" "$KEY"
+fi
+CHKSUM="$SUMALGO $(printf %s "$KEY" | b64)"
 
 [[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nCHKSUM: $CHKSUM"
 
 # head request
 TUSURL=$(locate "$HOST" "$KEY")
-[[ $LOCATE ]] && info "URL: $TUSURL" && [[ $TUSURL != "null" ]]; [[ $LOCATE ]] && exit $?
-[[ $TUSURL ]] && [[ "null" != "$TUSURL" ]] && request "--head $TUSURL"
+[[ $LOCATE ]] && info "URL: $TUSURL" && [[ -n "$TUSURL" ]]; [[ $LOCATE ]] && exit $?
+[[ -n "$TUSURL" ]] && request "--head $TUSURL"
 
 FILEPART=$FILE
-if [[ "null" != "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
+if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
   OFFSET=$(header "Upload-Offset") LEFTOVER=$((SIZE - OFFSET))
   [[ $LEFTOVER -eq 0 ]] && exit 0
   [[ $OFFSET -gt 0 && $DEBUG ]] && comment "> filepart $OFFSET $LEFTOVER $FILE"
@@ -241,8 +313,8 @@ if [[ "null" != "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
 # create request
 else
   OFFSET=0 LEFTOVER=$SIZE
-  META="filename $(echo -n $NAME | base64 -w 0)"
-  [[ $CREDS ]] && META="$META,user $(echo -n $USER | base64 -w 0)"
+  META="filename $(printf %s "$NAME" | b64)"
+  [[ $CREDS ]] && META="$META,user $(printf %s "$USER" | b64)"
   request "-H 'Upload-Length: $SIZE' \
     -H 'Upload-Key: $KEY' \
     -H 'Upload-Checksum: $CHKSUM' \
@@ -251,7 +323,7 @@ else
 
   # save location config
   TUSURL=$(header "Location")
-  [[ $TUSURL ]] && tus-config ".[\"$KEY\"].\"loc$HOST\"" "$TUSURL"
+  [[ $TUSURL ]] && cache-loc-set "$HOST" "$KEY" "$TUSURL"
 fi
 
 # show spinner
