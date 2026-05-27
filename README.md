@@ -1,14 +1,13 @@
-# adhocore/tusc.sh
+# Astera-org/tusc.sh
 
-[![Latest Version](https://img.shields.io/github/release/adhocore/tusc.sh.svg?style=flat-square)](https://github.com/adhocore/tusc.sh/releases)
-[![Test](https://github.com/adhocore/tusc.sh/actions/workflows/test.yml/badge.svg)](https://github.com/adhocore/tusc.sh/actions/workflows/test.yml)
+[![Test](https://github.com/Astera-org/tusc.sh/actions/workflows/test.yml/badge.svg)](https://github.com/Astera-org/tusc.sh/actions/workflows/test.yml)
 [![Software License](https://img.shields.io/badge/license-MIT-brightgreen.svg?style=flat-square)](LICENSE)
-[![Tweet](https://img.shields.io/twitter/url/http/shields.io.svg?style=social)](https://twitter.com/intent/tweet?text=Resumable+large+file+uploads+via+TUS+client+protocol+implemented+in+bash&url=https://github.com/adhocore/tusc.sh&hashtags=bash,tus,resumable,uploads)
-[![Support](https://img.shields.io/static/v1?label=Support&message=%E2%9D%A4&logo=GitHub)](https://github.com/sponsors/adhocore)
-<!-- [![Donate 15](https://img.shields.io/badge/donate-paypal-blue.svg?style=flat-square&label=donate+15)](https://www.paypal.me/ji10/15usd)
-[![Donate 25](https://img.shields.io/badge/donate-paypal-blue.svg?style=flat-square&label=donate+25)](https://www.paypal.me/ji10/25usd)
-[![Donate 50](https://img.shields.io/badge/donate-paypal-blue.svg?style=flat-square&label=donate+50)](https://www.paypal.me/ji10/50usd) -->
 
+This is the [Astera Institute](https://astera.org) fork of
+[`adhocore/tusc.sh`](https://github.com/adhocore/tusc.sh) with macOS /
+`bash` 3.2 portability, no `jq` dependency, progress / resume
+visibility, recursive upload, and a Lima-based Linux test harness.
+Upstream's original copyright is preserved in [`LICENSE`](LICENSE).
 
 `tusc` is [tus 1.0.0](https://tus.io) client protocol implementation for bash.
 
@@ -21,12 +20,14 @@ If anything goes wrong, you can rerun the command to resume upload from where it
 ## Installation
 
 ```sh
-curl -sSLo ~/tusc https://raw.githubusercontent.com/adhocore/tusc.sh/main/tusc.sh
+curl -fsSLo ~/tusc https://raw.githubusercontent.com/Astera-org/tusc.sh/main/tusc.sh
 # for global binary
 chmod +x ~/tusc && sudo ln -s ~/tusc /usr/local/bin/tusc
 # OR, for user binary
 chmod +x ~/tusc && mv ~/tusc ~/.local/bin/tusc
 ```
+
+`tusc --update` will pull the latest `tusc.sh` from this same fork.
 
 This fork runs on stock macOS using the system `/bin/bash` (3.2) — no
 Homebrew bash, no GNU coreutils, no `jq` required.

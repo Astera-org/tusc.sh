@@ -66,11 +66,11 @@ version() { echo v1.1.1; }
 # update tusc
 update()
 {
-  NEWVER=`curl -sSL https://raw.githubusercontent.com/adhocore/tusc.sh/master/VERSION`
+  NEWVER=`curl -fsSL https://raw.githubusercontent.com/Astera-org/tusc.sh/main/VERSION`
   [[ "v$NEWVER" == "$(version)" ]] && ok "Already latest version" 0
 
   info "Updating $TUSC ..."
-  curl -sSLo ${FULL} https://raw.githubusercontent.com/adhocore/tusc.sh/master/tusc.sh
+  curl -fsSLo ${FULL} https://raw.githubusercontent.com/Astera-org/tusc.sh/main/tusc.sh
   ok "  Done [${NEWVER}]"
 }
 
