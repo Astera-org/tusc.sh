@@ -47,10 +47,47 @@ Homebrew bash, no GNU coreutils, no `jq` required.
 
 ### Resume-state cache
 
-Resume state lives at `$TMPDIR/tusc.<uid>/` (override with the `TUSDIR`
-env var). It's keyed by sha1 of the file path + mtime so renaming or
-touching the file forces a re-hash, and one file per cache entry means
-nothing to parse or corrupt.
+`tusc.sh` keeps a small per-user cache so that interrupting an upload
+(Ctrl-C, network drop, server restart) and re-running the same command
+**resumes from where it left off** instead of starting over. Two kinds
+of entries get stored:
+
+| File                                          | Holds                                  | Why                                      |
+| --------------------------------------------- | -------------------------------------- | ---------------------------------------- |
+| `ck.<sha1-of-path:mtime>.<algo>`              | The file's sha1/sha256/… hex digest    | Skip re-hashing multi-GB files each run  |
+| `loc.<checksum>.<sha1-of-host+base-path>`     | The TUS upload URL returned by `POST`  | Lets the next run `HEAD` it and resume   |
+
+Touching or rewriting the file changes its mtime, which invalidates
+the checksum entry — so the cache never serves stale hashes.
+
+**Location**
+
+Default: `${TMPDIR:-/tmp}/tusc.<uid>/` — under the OS temp dir, mode
+`0700`, scoped per Unix uid. Survives across invocations within a
+session; the OS will reclaim it on reboot/cleanup.
+
+Override with the `TUSDIR` environment variable:
+
+```sh
+# Cache that survives reboots
+TUSDIR=~/.cache/tusc ./tusc.sh -H ... -f ...
+
+# Fully isolated, single-run cache
+TUSDIR=$(mktemp -d) ./tusc.sh -H ... -f ...
+```
+
+**When to wipe it**
+
+```sh
+rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
+```
+
+- the file changed but mtime didn't (unusual — touch the file instead),
+- you want to force a brand-new TUS upload rather than resuming an
+  existing one,
+- you suspect the cached resume URL points at an upload the server has
+  since deleted (in that case `tusc.sh` will detect the `404` on `HEAD`
+  and POST a new upload anyway, so this is mostly defensive).
 
 
 ## Usage and Examples

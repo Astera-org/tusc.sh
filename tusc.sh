@@ -43,14 +43,22 @@ checksum() # $1 = algo (sha1|sha256|...), $2 = file -> prints "<hex>  <file>"
 }
 
 # message helpers
+# Arguments: $1=text, $2=color, $3=style, $4=exit-code (optional),
+# $5=target fd (1=stdout default, 2=stderr).
 line() {
-  [[ $NOCOLOR ]] && printf '%b\n' "$1" || printf '\033[%s;%sm%b\033[0m\n' "${3:-0}" "$2" "$1"
+  local fd=${5:-1}
+  if [[ $NOCOLOR ]]; then
+    printf '%b\n' "$1" >&"$fd"
+  else
+    printf '\033[%s;%sm%b\033[0m\n' "${3:-0}" "$2" "$1" >&"$fd"
+  fi
   [[ "$4" == "" ]] || exit $4
 }
-error() { line "$1" 31 0 $2; }
-ok() { line "${1:-  Done}" 32 0 $2; }
-info() { line "$1" 33 0 $2; }
-comment() { line "$1" 30 1 $2; }
+error()   { line "$1" 31 0 "$2" 2; }    # red,  stderr
+ok()      { line "${1:-  Done}" 32 0 "$2"; }
+info()    { line "$1" 33 0 "$2"; }
+comment() { line "$1" 30 1 "$2"; }      # dim,  stdout (used to render --help text)
+debug()   { line "$1" 30 1 "$2" 2; }    # dim,  stderr (DEBUG=1 trace lines)
 
 # show version
 version() { echo v1.1.1; }
@@ -72,6 +80,7 @@ usage()
   cat << USAGE
   $TUSC $(info `version`) | $(ok "(c) Jitendra Adhikari") | https://github.com/adhocore
   $TUSC is bash implementation of tus-client (https://tus.io).
+  With contributions from $(ok "Astera Institute") (https://astera.org).
 
   $(ok Usage:)
     $TUSC <--options>
@@ -92,6 +101,11 @@ usage()
     $(info "-S --no-spin")   $(comment "Donot show the spinner (Useful for parsing output).")
     $(info "-u --update")    $(comment "Update tusc to latest version.")
     $(info "   --version")   $(comment "Print the current tusc version.")
+
+  $(ok Environment:)
+    $(info "DEBUG=1")        $(comment "Verbose curl + show debug headers on stderr.")
+    $(info "TUSDIR")         $(comment "Cache dir for resume state and file checksums.")
+                   $(comment "(Default: \$TMPDIR/tusc.<uid>/. Delete to force a fresh upload.)")
 
   $(ok Examples:)
     $TUSC --help                           # shows this help
@@ -138,14 +152,15 @@ cache-checksum-set() # $1 = "<file>:<mtime>", $2 = algo, $3 = hex digest
   printf %s "$3" > "$TUSDIR/ck.$(strhash "$1").$2"
 }
 
-# Cached resume URL for a (checksum-key, host) pair.
-cache-loc-get() # $1 = host, $2 = key
+# Cached resume URL for a (checksum-key, host+base-path) pair. Base-path
+# is part of the key so changing it doesn't reuse a stale upload URL.
+cache-loc-get() # $1 = host+basepath, $2 = key
 {
   local f="$TUSDIR/loc.$2.$(strhash "$1")"
   [[ -f "$f" ]] && cat "$f"
   return 0
 }
-cache-loc-set() # $1 = host, $2 = key, $3 = url
+cache-loc-set() # $1 = host+basepath, $2 = key, $3 = url
 {
   ensure-tusdir
   printf %s "$3" > "$TUSDIR/loc.$2.$(strhash "$1")"
@@ -158,9 +173,9 @@ ensure-tusdir()
   chmod 700 "$TUSDIR"
 }
 
-locate() # $1 = HOST, $2 = key
+locate() # $1 = HOST, $2 = BASEPATH, $3 = key
 {
-  cache-loc-get "$1" "$2"
+  cache-loc-get "$1$2" "$3"
 }
 
 # create a part of file (portable: BSD dd has no iflag=skip_bytes)
@@ -175,13 +190,23 @@ request()
 {
   echo > $HEADER
   [[ $CREDS ]] && USERPASS="--basic --user '$USER:$PASS' "
-  [[ $DEBUG ]] && comment "> curl ${USERPASS//:$PASS/}-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $1"
+  [[ $DEBUG ]] && debug "> curl ${USERPASS//:$PASS/}-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $1"
   [[ $DEBUG ]] && DBG="-v"
-  BODY=$(bash -c "curl $DBG $USERPASS-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $CURLARGS $1")
+
+  # Capture stderr too so connection/transport errors aren't silently lost.
+  # In DEBUG mode `-v` writes to stderr; we still want to see it live, so
+  # only redirect stderr->stdout when not in DEBUG.
+  local stderr_redir="2>&1"
+  [[ $DEBUG ]] && stderr_redir=""
+  BODY=$(bash -c "curl $DBG $USERPASS-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $CURLARGS $1 $stderr_redir")
 
   STATUS=$(awk '/^HTTP\// { match($0, /[0-9][0-9][0-9]/); s = substr($0,RSTART,3) } END { print s }' "$HEADER")
   if [[ "$STATUS" == 20* ]]; then ISOK=1 RET=0; else ISOK=0 RET=1; fi
-  if [[ $ISOK -eq 0 ]] && [[ "$1" != *"--head"* ]]; then error "$BODY" 1; fi
+  if [[ $ISOK -eq 0 ]] && [[ "$1" != *"--head"* ]]; then
+    local msg="✖ Request failed: HTTP ${STATUS:-?} on $(echo "$1" | awk '{print $NF}')"
+    [[ -n "$BODY" ]] && msg="$msg"$'\n'"$BODY"
+    error "$msg" 1
+  fi
   return $RET
 }
 
@@ -288,7 +313,7 @@ HEADER=`mktemp -t tus.XXXXXXXXXX`
 # calc &/or cache key and checksum
 KEY=$(cache-checksum-get "$FILE:$MTIME" "$SUMALGO")
 if [[ -z "$KEY" ]]; then
-  [[ $DEBUG ]] && comment "> checksum $SUMALGO $FILE"
+  [[ $DEBUG ]] && debug "> checksum $SUMALGO $FILE"
   spinner
   read -r KEY _ <<< "$(checksum "$SUMALGO" "$FILE")"
   no-spinner
@@ -299,7 +324,8 @@ CHKSUM="$SUMALGO $(printf %s "$KEY" | b64)"
 [[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nCHKSUM: $CHKSUM"
 
 # head request
-TUSURL=$(locate "$HOST" "$KEY")
+BASEPATH=${BASEPATH:-/files/}
+TUSURL=$(locate "$HOST" "$BASEPATH" "$KEY")
 [[ $LOCATE ]] && info "URL: $TUSURL" && [[ -n "$TUSURL" ]]; [[ $LOCATE ]] && exit $?
 [[ -n "$TUSURL" ]] && request "--head $TUSURL"
 
@@ -307,7 +333,7 @@ FILEPART=$FILE
 if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
   OFFSET=$(header "Upload-Offset") LEFTOVER=$((SIZE - OFFSET))
   [[ $LEFTOVER -eq 0 ]] && exit 0
-  [[ $OFFSET -gt 0 && $DEBUG ]] && comment "> filepart $OFFSET $LEFTOVER $FILE"
+  [[ $OFFSET -gt 0 && $DEBUG ]] && debug "> filepart $OFFSET $LEFTOVER $FILE"
   [[ $OFFSET -gt 0 ]] && spinner && FILEPART=`filepart $OFFSET $LEFTOVER $FILE` && no-spinner
 
 # create request
@@ -319,22 +345,24 @@ else
     -H 'Upload-Key: $KEY' \
     -H 'Upload-Checksum: $CHKSUM' \
     -H 'Upload-Metadata: $META' \
-    -X POST $HOST${BASEPATH:-/files/}"
+    -X POST $HOST$BASEPATH"
 
   # save location config
   TUSURL=$(header "Location")
-  [[ $TUSURL ]] && cache-loc-set "$HOST" "$KEY" "$TUSURL"
+  [[ $TUSURL ]] && cache-loc-set "$HOST$BASEPATH" "$KEY" "$TUSURL"
 fi
 
 # show spinner
 spinner
 
-# patch request
+# patch request — `--upload-file` already sets Content-Length from the
+# file size; an explicit `Transfer-Encoding: chunked` here is invalid
+# over HTTP/2 (e.g. behind an AWS ELB) and makes curl send chunk-framed
+# bytes inside the H2 body, tripping a 400 at the load balancer.
 request "-H 'Content-Type: application/offset+octet-stream' \
   -H 'Content-Length: $LEFTOVER' \
   -H 'Upload-Checksum: $CHKSUM' \
   -H 'Upload-Offset: $OFFSET' \
-  -H 'Transfer-Encoding: chunked' \
   --upload-file '$FILEPART' \
   --request PATCH '$TUSURL'" || error "Request failed" 1
 
