@@ -414,8 +414,12 @@ if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
   # Server reports this upload is already complete — short-circuit and
   # tell the user it was a no-op (re-run with --force to upload again).
   [[ $LEFTOVER -eq 0 ]] && SKIPPED=1 && exit 0
-  [[ $OFFSET -gt 0 && $DEBUG ]] && debug "> filepart $OFFSET $LEFTOVER $FILE"
-  [[ $OFFSET -gt 0 ]] && spinner && FILEPART=`filepart $OFFSET $LEFTOVER $FILE` && no-spinner
+  if [[ $OFFSET -gt 0 ]]; then
+    PCT=$(( OFFSET * 100 / SIZE ))
+    info "↻ Resuming at byte $OFFSET / $SIZE (${PCT}%)"
+    [[ $DEBUG ]] && debug "> filepart $OFFSET $LEFTOVER $FILE"
+    spinner && FILEPART=`filepart $OFFSET $LEFTOVER $FILE` && no-spinner
+  fi
 
 # create request
 else
