@@ -107,11 +107,11 @@ usage()
                      $(line 'USER="my_user"' 36)
                      $(line 'PASS="my_pass"' 36)
     $(info "-C --no-color")  $(comment "Donot color the output (Useful for parsing output).")
-    $(info "-f --file")      $(comment "The file to upload (or directory, with -R).")
+    $(info "-f --file")      $(comment "The file to upload (or directory, with -d).")
     $(info "-F --force")     $(comment "Ignore the cached upload URL; start a fresh upload.")
     $(info "-N --name")      $(comment "Override the filename sent in Upload-Metadata.")
                    $(comment "(May contain slashes; server gets the literal value.)")
-    $(info "-R --recursive") $(comment "Treat --file as a directory; upload every file under it,")
+    $(info "-d --dir")       $(comment "Treat --file as a directory; upload every file under it,")
                    $(comment "preserving the relative path in Upload-Metadata.filename.")
     $(info "-h --help")      $(comment "Show help information and usage.")
     $(info "-H --host")      $(comment "The tus-server host where file is uploaded.")
@@ -370,7 +370,7 @@ while [[ $# -gt 0 ]]; do
     -L | --locate) LOCATE=1; shift ;;
     -S | --no-spin) NOSPIN=1; shift ;;
     -F | --force) FORCE=1; shift ;;
-    -R | --recursive) RECURSIVE=1; shift ;;
+    -d | --dir) DIRMODE=1; shift ;;
     -N | --name) NAME_OVERRIDE="$2"; shift 2 ;;
     -u | --update) update; exit 0 ;;
          --version | version) version; exit 0 ;;
@@ -386,14 +386,14 @@ done
 [[ $HOST ]] || [[ $LOCATE ]] || error "--host required" 1
 [[ $FILE ]] || error "--file required" 1
 
-# Recursive mode: --file is a directory; upload each regular file under
+# Directory mode: --file is a directory; upload each regular file under
 # it one at a time, re-exec'ing this script per file with the relative
 # path passed in --name (which is what gets base64'd into
 # Upload-Metadata.filename). The base-path stays fixed; the
 # subdirectory ends up in the filename metadata.
-if [[ $RECURSIVE ]]; then
+if [[ $DIRMODE ]]; then
   ROOT=$(realpath "$FILE") || error "--file '$FILE' not found" 1
-  [[ -d "$ROOT" ]] || error "--file must be a directory when -R is given" 1
+  [[ -d "$ROOT" ]] || error "--file must be a directory when -d/--dir is given" 1
   ROOT="${ROOT%/}"
 
   total=0 idx=0 fails=0

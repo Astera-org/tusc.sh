@@ -6,7 +6,7 @@
 This is the [Astera Institute](https://astera.org) fork of
 [`adhocore/tusc.sh`](https://github.com/adhocore/tusc.sh) with macOS /
 `bash` 3.2 portability, no `jq` dependency, progress / resume
-visibility, recursive upload, and a Lima-based Linux test harness.
+visibility, directory upload, and a Lima-based Linux test harness.
 Upstream's original copyright is preserved in [`LICENSE`](LICENSE).
 
 `tusc` is [tus 1.0.0](https://tus.io) client protocol implementation for bash.
@@ -109,11 +109,11 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
                      USER="my_user"
                      PASS="my_pass"
     -C --no-color  Donot color the output (Useful for parsing output).
-    -f --file      The file to upload (or directory, with -R).
+    -f --file      The file to upload (or directory, with -d).
     -F --force     Ignore the cached upload URL; start a fresh upload.
     -N --name      Override the filename sent in Upload-Metadata.
                    (May contain slashes; server gets the literal value.)
-    -R --recursive Treat --file as a directory; upload every file under it,
+    -d --dir       Treat --file as a directory; upload every file under it,
                    preserving the relative path in Upload-Metadata.filename.
     -h --help      Show help information and usage.
     -H --host      The tus-server host where file is uploaded.
