@@ -347,7 +347,11 @@ TUSURL=$(locate "$HOST" "$BASEPATH" "$KEY")
 # --force ignores any cached upload URL so we always start a fresh POST.
 [[ $FORCE ]] && TUSURL=""
 [[ $LOCATE ]] && info "URL: $TUSURL" && [[ -n "$TUSURL" ]]; [[ $LOCATE ]] && exit $?
-[[ -n "$TUSURL" ]] && request "--head $TUSURL"
+# Probe the cached URL with a HEAD. A non-2xx here just means the
+# server forgot the upload (tusd's retention expired, host cleaned up,
+# etc.) — fall through to a fresh POST. `|| true` keeps `set -e` from
+# aborting the script silently on the HEAD's non-zero return.
+[[ -n "$TUSURL" ]] && { request "--head $TUSURL" || true; }
 
 FILEPART=$FILE
 if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
