@@ -95,6 +95,7 @@ usage()
                      $(line 'PASS="my_pass"' 36)
     $(info "-C --no-color")  $(comment "Donot color the output (Useful for parsing output).")
     $(info "-f --file")      $(comment "The file to upload.")
+    $(info "-F --force")     $(comment "Ignore the cached upload URL; start a fresh upload.")
     $(info "-h --help")      $(comment "Show help information and usage.")
     $(info "-H --host")      $(comment "The tus-server host where file is uploaded.")
     $(info "-L --locate")    $(comment "Locate the uploaded file in tus-server.")
@@ -280,7 +281,11 @@ on-exit()
   [[ $OFFSET ]] || return 0
 
   if [[ $LEFTOVER -eq 0 ]]; then
-    ok "✔ Uploaded successfully!"
+    if [[ $SKIPPED ]]; then
+      ok "ℹ Already uploaded — skipping (re-run with --force to overwrite)."
+    else
+      ok "✔ Uploaded successfully!"
+    fi
   else
     error "✖ Unfinished upload, please rerun the command to resume." 1
   fi
@@ -299,6 +304,7 @@ while [[ $# -gt 0 ]]; do
     -H | --host) HOST="$2"; shift 2 ;;
     -L | --locate) LOCATE=1; shift ;;
     -S | --no-spin) NOSPIN=1; shift ;;
+    -F | --force) FORCE=1; shift ;;
     -u | --update) update; exit 0 ;;
          --version | version) version; exit 0 ;;
     --) shift; CURLARGS=$@; break ;;
@@ -338,13 +344,17 @@ CHKSUM="$SUMALGO $(printf %s "$KEY" | b64)"
 # head request
 BASEPATH=${BASEPATH:-/files/}
 TUSURL=$(locate "$HOST" "$BASEPATH" "$KEY")
+# --force ignores any cached upload URL so we always start a fresh POST.
+[[ $FORCE ]] && TUSURL=""
 [[ $LOCATE ]] && info "URL: $TUSURL" && [[ -n "$TUSURL" ]]; [[ $LOCATE ]] && exit $?
 [[ -n "$TUSURL" ]] && request "--head $TUSURL"
 
 FILEPART=$FILE
 if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
   OFFSET=$(header "Upload-Offset") LEFTOVER=$((SIZE - OFFSET))
-  [[ $LEFTOVER -eq 0 ]] && exit 0
+  # Server reports this upload is already complete — short-circuit and
+  # tell the user it was a no-op (re-run with --force to upload again).
+  [[ $LEFTOVER -eq 0 ]] && SKIPPED=1 && exit 0
   [[ $OFFSET -gt 0 && $DEBUG ]] && debug "> filepart $OFFSET $LEFTOVER $FILE"
   [[ $OFFSET -gt 0 ]] && spinner && FILEPART=`filepart $OFFSET $LEFTOVER $FILE` && no-spinner
 
