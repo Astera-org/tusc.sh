@@ -43,6 +43,18 @@ checksum() # $1 = algo (sha1|sha256|...), $2 = file -> prints "<hex>  <file>"
   fi
 }
 
+# Base64-of-raw-digest for the TUS Upload-Checksum header. Per
+# https://tus.io/protocols/resumable-upload, the value is the base64
+# encoding of the *raw* digest bytes of the current request body — not
+# base64 of the hex string, and not the full-file hash on a partial
+# PATCH. Returns empty string if openssl isn't available; callers
+# treat that as "omit the header".
+body-checksum-b64() # $1 = algo, $2 = file (the actual PATCH body)
+{
+  command -v openssl >/dev/null 2>&1 || return 0
+  openssl dgst "-$1" -binary "$2" 2>/dev/null | base64 | tr -d '\n'
+}
+
 # message helpers
 # Arguments: $1=text, $2=color, $3=style, $4=exit-code (optional),
 # $5=target fd (1=stdout default, 2=stderr).
@@ -431,9 +443,7 @@ if [[ -z "$KEY" ]]; then
   no-spinner
   cache-checksum-set "$FILE:$MTIME" "$SUMALGO" "$KEY"
 fi
-CHKSUM="$SUMALGO $(printf %s "$KEY" | b64)"
-
-[[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nCHKSUM: $CHKSUM"
+[[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY"
 
 # head request
 BASEPATH=${BASEPATH:-/files/}
@@ -465,10 +475,10 @@ else
   OFFSET=0 LEFTOVER=$SIZE
   META="filename $(printf %s "$NAME" | b64)"
   [[ $CREDS ]] && META="$META,user $(printf %s "$USER" | b64)"
+  # No Upload-Checksum on the POST: the create request has no body.
   request \
     -H "Upload-Length: $SIZE" \
     -H "Upload-Key: $KEY" \
-    -H "Upload-Checksum: $CHKSUM" \
     -H "Upload-Metadata: $META" \
     -X POST "$HOST$BASEPATH"
 
@@ -485,14 +495,20 @@ fi
 # file size; an explicit `Transfer-Encoding: chunked` here is invalid
 # over HTTP/2 (e.g. behind an AWS ELB) and makes curl send chunk-framed
 # bytes inside the H2 body, tripping a 400 at the load balancer.
-request \
-  -H "Content-Type: application/offset+octet-stream" \
-  -H "Content-Length: $LEFTOVER" \
-  -H "Upload-Checksum: $CHKSUM" \
-  -H "Upload-Offset: $OFFSET" \
-  --upload-file "$FILEPART" \
-  --request PATCH "$TUSURL" \
-  || error "Request failed" 1
+#
+# Per the TUS spec, Upload-Checksum is for the *current request body*.
+# That means we have to digest FILEPART (the partial slice on resume),
+# not the whole file. Skip the header if openssl isn't available — the
+# spec makes Upload-Checksum optional.
+PATCH_ARGS=(
+  -H "Content-Type: application/offset+octet-stream"
+  -H "Content-Length: $LEFTOVER"
+  -H "Upload-Offset: $OFFSET"
+)
+PATCH_SUM=$(body-checksum-b64 "$SUMALGO" "$FILEPART")
+[[ -n "$PATCH_SUM" ]] && PATCH_ARGS+=(-H "Upload-Checksum: $SUMALGO $PATCH_SUM")
+PATCH_ARGS+=(--upload-file "$FILEPART" --request PATCH "$TUSURL")
+request "${PATCH_ARGS[@]}" || error "Request failed" 1
 
 HEADER0=$HEADER HEADER=`mktemp -t tus.XXXXXXXXXX`
 while :; do
