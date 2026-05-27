@@ -193,12 +193,18 @@ request()
   [[ $DEBUG ]] && debug "> curl ${USERPASS//:$PASS/}-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $1"
   [[ $DEBUG ]] && DBG="-v"
 
-  # Capture stderr too so connection/transport errors aren't silently lost.
-  # In DEBUG mode `-v` writes to stderr; we still want to see it live, so
-  # only redirect stderr->stdout when not in DEBUG.
+  # Quiet by default (-sS = silent + show errors). For the PATCH — the
+  # only large body transfer — drop -s so curl's built-in progress meter
+  # writes to stderr.
+  local SILENT="-sS"
   local stderr_redir="2>&1"
+  if [[ "$1" == *"--request PATCH"* && -z $NOSPIN && -z $DEBUG ]]; then
+    SILENT="-S"
+    stderr_redir=""   # let curl's progress meter reach the terminal
+  fi
   [[ $DEBUG ]] && stderr_redir=""
-  BODY=$(bash -c "curl $DBG $USERPASS-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $CURLARGS $1 $stderr_redir")
+
+  BODY=$(bash -c "curl $DBG $USERPASS${SILENT}LD $HEADER -H 'Tus-Resumable: 1.0.0' $CURLARGS $1 $stderr_redir")
 
   STATUS=$(awk '/^HTTP\// { match($0, /[0-9][0-9][0-9]/); s = substr($0,RSTART,3) } END { print s }' "$HEADER")
   if [[ "$STATUS" == 20* ]]; then ISOK=1 RET=0; else ISOK=0 RET=1; fi
@@ -254,7 +260,13 @@ no-spinner()
   [[ $NOSPIN ]] && return 0
   local PID=$SPINID
   SPINID=0
-  [[ $PID -eq 0 ]] || kill $PID 2> /dev/null
+  if [[ $PID -ne 0 ]]; then
+    kill $PID 2> /dev/null
+    wait $PID 2> /dev/null
+  fi
+  # Overwrite whatever glyph the spinner left at the cursor with a
+  # space, then return to col 0. Works without ANSI support.
+  printf '\r  \r' >&2
 }
 
 # exit handler
@@ -352,8 +364,9 @@ else
   [[ $TUSURL ]] && cache-loc-set "$HOST$BASEPATH" "$KEY" "$TUSURL"
 fi
 
-# show spinner
-spinner
+# curl's built-in progress meter does the job for the PATCH (visible in
+# request() unless -S/--no-spin or DEBUG=1 is set), so don't start the
+# bash spinner here.
 
 # patch request — `--upload-file` already sets Content-Length from the
 # file size; an explicit `Transfer-Encoding: chunked` here is invalid
