@@ -209,7 +209,17 @@ request()
 
   STATUS=$(awk '/^HTTP\// { match($0, /[0-9][0-9][0-9]/); s = substr($0,RSTART,3) } END { print s }' "$HEADER")
   if [[ "$STATUS" == 20* ]]; then ISOK=1 RET=0; else ISOK=0 RET=1; fi
-  if [[ $ISOK -eq 0 ]] && [[ "$1" != *"--head"* ]]; then
+
+  # For a HEAD probe, only 404/410 are "expected cache misses" that the
+  # caller can recover from by creating a new upload. Anything else —
+  # auth failure, server error, missing status (curl couldn't even
+  # parse a response) — is a real problem and must surface.
+  local suppress=0
+  if [[ "$1" == *"--head"* ]] && [[ "$STATUS" == "404" || "$STATUS" == "410" ]]; then
+    suppress=1
+  fi
+
+  if [[ $ISOK -eq 0 && $suppress -eq 0 ]]; then
     local msg="✖ Request failed: HTTP ${STATUS:-?} on $(echo "$1" | awk '{print $NF}')"
     [[ -n "$BODY" ]] && msg="$msg"$'\n'"$BODY"
     error "$msg" 1
