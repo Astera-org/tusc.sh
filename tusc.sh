@@ -253,12 +253,17 @@ request()
 
   # For PATCH and DEBUG, let stderr flow to the terminal (progress meter
   # / -v transcript). Otherwise fold stderr into the captured body so
-  # curl's transport errors land in the request-failed message.
+  # curl's transport errors land in the request-failed message. Suspend
+  # `set -e` around the substitution so a curl transport failure (curl
+  # exits non-zero, e.g. ECONNREFUSED) doesn't abort the script before
+  # we get to inspect $STATUS and emit a useful error.
+  set +e
   if [[ $DEBUG || $is_patch -eq 1 ]]; then
     BODY=$("${cmd[@]}")
   else
     BODY=$("${cmd[@]}" 2>&1)
   fi
+  set -e
 
   STATUS=$(awk '/^HTTP\// { match($0, /[0-9][0-9][0-9]/); s = substr($0,RSTART,3) } END { print s }' "$HEADER")
   if [[ "$STATUS" == 20* ]]; then ISOK=1 RET=0; else ISOK=0 RET=1; fi
