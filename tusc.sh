@@ -15,7 +15,8 @@
 
 if [[ -f $HOME/.tus.dbg ]]; then set -ex; else set -e; fi
 
-FULL=$(readlink -f $0) TUSC=$(basename $0) SPINID=0 CURLARGS=
+FULL=$(readlink -f $0) TUSC=$(basename $0) SPINID=0
+CURLARGS=()   # passthrough curl args captured after `--`
 
 ISOK=0    # is last request ok?
 STATUS=   # last response status code
@@ -191,25 +192,61 @@ filepart() # $1 = start_byte, $2 = byte_length (unused; always remainder), $3 = 
 }
 
 # http request
+#
+# Takes curl arguments as separate positional parameters (an argv
+# array) and invokes curl directly — never via `bash -c` and never
+# through a concatenated shell string. This is deliberate: the TUS
+# `Location` header we cache and pass back as the upload URL is
+# server-controlled, and a malicious or compromised server could
+# otherwise embed shell metacharacters that would execute during the
+# next PATCH/HEAD.
 request()
 {
-  echo > $HEADER
-  [[ $CREDS ]] && USERPASS="--basic --user '$USER:$PASS' "
-  [[ $DEBUG ]] && debug "> curl ${USERPASS//:$PASS/}-sSLD $HEADER -H 'Tus-Resumable: 1.0.0' $1"
-  [[ $DEBUG ]] && DBG="-v"
+  echo > "$HEADER"
 
-  # Quiet by default (-sS = silent + show errors). For the PATCH — the
-  # only large body transfer — drop -s so curl's built-in progress meter
-  # writes to stderr.
-  local SILENT="-sS"
-  local stderr_redir="2>&1"
-  if [[ "$1" == *"--request PATCH"* && -z $NOSPIN && -z $DEBUG ]]; then
-    SILENT="-S"
-    stderr_redir=""   # let curl's progress meter reach the terminal
+  # Scan for the request shape so we can adjust verbosity. Look at the
+  # CLI tokens we'll pass to curl — both --head and PATCH appear as
+  # standalone args (--head is a single flag; PATCH follows --request).
+  local arg is_head=0 is_patch=0
+  for arg in "$@"; do
+    case "$arg" in
+      --head) is_head=1 ;;
+      PATCH)  is_patch=1 ;;
+    esac
+  done
+
+  # Build the curl argv array.
+  local cmd=(curl)
+  [[ $DEBUG ]] && cmd+=(-v)
+  # -sS = silent + show errors. For the PATCH (the only large body
+  # transfer) we drop -s so curl's progress meter writes to stderr.
+  if [[ $is_patch -eq 1 && -z $NOSPIN && -z $DEBUG ]]; then
+    cmd+=(-S)
+  else
+    cmd+=(-sS)
   fi
-  [[ $DEBUG ]] && stderr_redir=""
+  cmd+=(-L -D "$HEADER" -H "Tus-Resumable: 1.0.0")
+  [[ $CREDS ]] && cmd+=(--basic --user "$USER:$PASS")
+  # CURLARGS is a user-supplied passthrough captured as an array from
+  # the "--" sentinel during argv parsing. Safe to splat directly.
+  [[ ${#CURLARGS[@]} -gt 0 ]] && cmd+=("${CURLARGS[@]}")
+  cmd+=("$@")
 
-  BODY=$(bash -c "curl $DBG $USERPASS${SILENT}LD $HEADER -H 'Tus-Resumable: 1.0.0' $CURLARGS $1 $stderr_redir")
+  if [[ $DEBUG ]]; then
+    local pretty
+    pretty=$(printf '%q ' "${cmd[@]}")
+    [[ $CREDS ]] && pretty=${pretty//$PASS/***}
+    debug "> $pretty"
+  fi
+
+  # For PATCH and DEBUG, let stderr flow to the terminal (progress meter
+  # / -v transcript). Otherwise fold stderr into the captured body so
+  # curl's transport errors land in the request-failed message.
+  if [[ $DEBUG || $is_patch -eq 1 ]]; then
+    BODY=$("${cmd[@]}")
+  else
+    BODY=$("${cmd[@]}" 2>&1)
+  fi
 
   STATUS=$(awk '/^HTTP\// { match($0, /[0-9][0-9][0-9]/); s = substr($0,RSTART,3) } END { print s }' "$HEADER")
   if [[ "$STATUS" == 20* ]]; then ISOK=1 RET=0; else ISOK=0 RET=1; fi
@@ -219,12 +256,14 @@ request()
   # auth failure, server error, missing status (curl couldn't even
   # parse a response) — is a real problem and must surface.
   local suppress=0
-  if [[ "$1" == *"--head"* ]] && [[ "$STATUS" == "404" || "$STATUS" == "410" ]]; then
+  if [[ $is_head -eq 1 && ("$STATUS" == "404" || "$STATUS" == "410") ]]; then
     suppress=1
   fi
 
   if [[ $ISOK -eq 0 && $suppress -eq 0 ]]; then
-    local msg="✖ Request failed: HTTP ${STATUS:-?} on $(echo "$1" | awk '{print $NF}')"
+    # Last arg in the curl argv is the URL we hit.
+    local target=${cmd[${#cmd[@]}-1]}
+    local msg="✖ Request failed: HTTP ${STATUS:-?} on $target"
     [[ -n "$BODY" ]] && msg="$msg"$'\n'"$BODY"
     error "$msg" 1
   fi
@@ -323,7 +362,7 @@ while [[ $# -gt 0 ]]; do
     -N | --name) NAME_OVERRIDE="$2"; shift 2 ;;
     -u | --update) update; exit 0 ;;
          --version | version) version; exit 0 ;;
-    --) shift; CURLARGS=$@; break ;;
+    --) shift; CURLARGS=("$@"); break ;;
     *) if [[ $HOST ]]; then
         if [[ $FILE ]]; then SUMALGO="${SUMALGO:-$1}"; else FILE="$1"; fi
       else HOST=$1; fi
@@ -406,7 +445,7 @@ TUSURL=$(locate "$HOST" "$BASEPATH" "$KEY")
 # server forgot the upload (tusd's retention expired, host cleaned up,
 # etc.) — fall through to a fresh POST. `|| true` keeps `set -e` from
 # aborting the script silently on the HEAD's non-zero return.
-[[ -n "$TUSURL" ]] && { request "--head $TUSURL" || true; }
+[[ -n "$TUSURL" ]] && { request --head "$TUSURL" || true; }
 
 FILEPART=$FILE
 if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
@@ -426,11 +465,12 @@ else
   OFFSET=0 LEFTOVER=$SIZE
   META="filename $(printf %s "$NAME" | b64)"
   [[ $CREDS ]] && META="$META,user $(printf %s "$USER" | b64)"
-  request "-H 'Upload-Length: $SIZE' \
-    -H 'Upload-Key: $KEY' \
-    -H 'Upload-Checksum: $CHKSUM' \
-    -H 'Upload-Metadata: $META' \
-    -X POST $HOST$BASEPATH"
+  request \
+    -H "Upload-Length: $SIZE" \
+    -H "Upload-Key: $KEY" \
+    -H "Upload-Checksum: $CHKSUM" \
+    -H "Upload-Metadata: $META" \
+    -X POST "$HOST$BASEPATH"
 
   # save location config
   TUSURL=$(header "Location")
@@ -445,16 +485,18 @@ fi
 # file size; an explicit `Transfer-Encoding: chunked` here is invalid
 # over HTTP/2 (e.g. behind an AWS ELB) and makes curl send chunk-framed
 # bytes inside the H2 body, tripping a 400 at the load balancer.
-request "-H 'Content-Type: application/offset+octet-stream' \
-  -H 'Content-Length: $LEFTOVER' \
-  -H 'Upload-Checksum: $CHKSUM' \
-  -H 'Upload-Offset: $OFFSET' \
-  --upload-file '$FILEPART' \
-  --request PATCH '$TUSURL'" || error "Request failed" 1
+request \
+  -H "Content-Type: application/offset+octet-stream" \
+  -H "Content-Length: $LEFTOVER" \
+  -H "Upload-Checksum: $CHKSUM" \
+  -H "Upload-Offset: $OFFSET" \
+  --upload-file "$FILEPART" \
+  --request PATCH "$TUSURL" \
+  || error "Request failed" 1
 
 HEADER0=$HEADER HEADER=`mktemp -t tus.XXXXXXXXXX`
 while :; do
   [[ $(header "Upload-Offset") -eq $SIZE ]] && exit
-  request "--head $TUSURL" > /dev/null
+  request --head "$TUSURL" > /dev/null
   [[ $(header "Upload-Offset") -eq $SIZE ]] || sleep 2
 done
