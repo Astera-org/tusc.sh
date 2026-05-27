@@ -61,7 +61,7 @@ comment() { line "$1" 30 1 "$2"; }      # dim,  stdout (used to render --help te
 debug()   { line "$1" 30 1 "$2" 2; }    # dim,  stderr (DEBUG=1 trace lines)
 
 # show version
-version() { echo v1.1.1; }
+version() { echo v2.0.0; }
 
 # update tusc
 update()

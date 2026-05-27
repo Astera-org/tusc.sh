@@ -93,12 +93,13 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
 
 ## Usage and Examples
 ```
-  tusc v0.5.0 | (c) Jitendra Adhikari
-  tusc is bash implementation of tus-client (https://tus.io).
+  tusc.sh v2.0.0 | (c) Jitendra Adhikari | https://github.com/adhocore
+  tusc.sh is bash implementation of tus-client (https://tus.io).
+  With contributions from Astera Institute (https://astera.org).
 
   Usage:
-    tusc <--options> -- [curl args]
-    tusc <host> <file> [algo] -- [curl args]
+    tusc.sh <--options>
+    tusc.sh <host> <file> [algo]
 
   Options:
     -a --algo      The algorigthm for key &/or checksum.
@@ -108,7 +109,12 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
                      USER="my_user"
                      PASS="my_pass"
     -C --no-color  Donot color the output (Useful for parsing output).
-    -f --file      The file to upload.
+    -f --file      The file to upload (or directory, with -R).
+    -F --force     Ignore the cached upload URL; start a fresh upload.
+    -N --name      Override the filename sent in Upload-Metadata.
+                   (May contain slashes; server gets the literal value.)
+    -R --recursive Treat --file as a directory; upload every file under it,
+                   preserving the relative path in Upload-Metadata.filename.
     -h --help      Show help information and usage.
     -H --host      The tus-server host where file is uploaded.
     -L --locate    Locate the uploaded file in tus-server.
@@ -116,14 +122,19 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
     -u --update    Update tusc to latest version.
        --version   Print the current tusc version.
 
+  Environment:
+    DEBUG=1        Verbose curl + show debug headers on stderr.
+    TUSDIR         Cache dir for resume state and file checksums.
+                   (Default: $TMPDIR/tusc.<uid>/. Delete to force a fresh upload.)
+
   Examples:
-    tusc --help                           # shows this help
-    tusc --update                         # updates itself
-    tusc --version                        # prints current version of itself
-    tusc    0:1080    ww.mp4              # uploads ww.mp4 to http://0.0.0.0:1080/files/
-    tusc -H 0:1080 -f ww.mp4              # same as above
-    tusc -H 0:1080 -f ww.mp4 -- -Lv       # same as above plus sends -Lv to curl command
-    tusc -H 0:1080 -f ww.mp4 -a sha256    # same as above but uses sha256 algo for key/checksum
+    tusc.sh --help                           # shows this help
+    tusc.sh --update                         # updates itself
+    tusc.sh --version                        # prints current version of itself
+    tusc.sh    0:1080    ww.mp4              # uploads ww.mp4 to http://0.0.0.0:1080/files/
+    tusc.sh -H 0:1080 -f ww.mp4              # same as above
+    tusc.sh -H 0:1080 -f ww.mp4 -a sha256    # same as above but uses sha256 algo for key/checksum
+    tusc.sh -H 0:1080 -f ww.mp4 -b /store/   # uploads ww.mp4 to http://0.0.0.0:1080/store/
 ```
 
 If you want to parse the output of `tusc`, pass in `-C` (no color) and `-S` (no spin) flags. Eg:
