@@ -188,6 +188,9 @@ test_stale_cache_url_recovers() {
 }
 
 test_dir_upload_preserves_paths() {
+  # The source directory's basename must become the first path segment
+  # of every upload's filename — i.e. the directory itself shows up at
+  # the destination rather than being flattened into the upload root.
   local root="$WORK_DIR/dir-src"; local tdir="$WORK_DIR/dir-cache"
   mkdir -p "$root/a/b" "$root/c"
   echo aaa > "$root/top.txt"
@@ -198,8 +201,8 @@ test_dir_upload_preserves_paths() {
     || fail "tusc -d failed"
 
   # tusd v2 stores Upload-Metadata in <uploadid>.info next to the file.
-  # Look for each expected relpath in any of the .info files.
-  local expected_names=(top.txt a/b/nested.txt c/cc.bin)
+  # Every uploaded file must show "dir-src/<rel-path>" in its .info.
+  local expected_names=(dir-src/top.txt dir-src/a/b/nested.txt dir-src/c/cc.bin)
   local n found
   for n in "${expected_names[@]}"; do
     found=0
@@ -208,6 +211,12 @@ test_dir_upload_preserves_paths() {
     done
     [[ $found -eq 1 ]] || fail "no .info has filename=$n"
   done
+  # Sanity: nothing should be uploaded with a leading-segment-stripped
+  # name (e.g. bare "top.txt" without the dir-src/ prefix).
+  for info in "$UPLOAD_DIR"/*.info; do
+    grep -q '"filename":"top.txt"' "$info" && fail "found unprefixed top.txt"
+  done
+  return 0
 }
 
 test_name_override() {

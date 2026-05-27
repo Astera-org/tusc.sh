@@ -394,22 +394,25 @@ done
 # Directory mode: --file is a directory; upload each regular file under
 # it one at a time, re-exec'ing this script per file with the relative
 # path passed in --name (which is what gets base64'd into
-# Upload-Metadata.filename). The base-path stays fixed; the
-# subdirectory ends up in the filename metadata.
+# Upload-Metadata.filename). The base-path stays fixed; the source
+# directory's basename becomes the first path segment of every name so
+# the directory itself materializes at the destination (instead of
+# its contents being splayed into the upload root).
 if [[ $DIRMODE ]]; then
   ROOT=$(realpath "$FILE") || error "--file '$FILE' not found" 1
   [[ -d "$ROOT" ]] || error "--file must be a directory when -d/--dir is given" 1
   ROOT="${ROOT%/}"
+  ROOT_NAME=$(basename "$ROOT")
 
   total=0 idx=0 fails=0
   while IFS= read -r -d '' f; do total=$((total+1)); done \
     < <(find "$ROOT" -type f -print0)
   [[ $total -eq 0 ]] && error "no files under '$ROOT'" 1
-  info "Uploading $total file(s) from $ROOT"
+  info "Uploading $total file(s) from $ROOT (as $ROOT_NAME/...)"
 
   while IFS= read -r -d '' f; do
     idx=$((idx+1))
-    rel="${f#$ROOT/}"
+    rel="$ROOT_NAME/${f#$ROOT/}"
     info "[$idx/$total] $rel"
     bash "$FULL" \
       ${NOCOLOR:+--no-color} \
