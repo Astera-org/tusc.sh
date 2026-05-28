@@ -219,6 +219,31 @@ test_dir_upload_preserves_paths() {
   return 0
 }
 
+test_identical_content_different_names() {
+  # Two files with identical bytes at different upload paths must
+  # produce distinct uploads. Before Upload-Key was namespaced by the
+  # destination name, a content-deduping server would hand the second
+  # POST back the first upload's id, and the follow-up PATCH would 404.
+  local root="$WORK_DIR/dupes"; local tdir="$WORK_DIR/dupes-cache"
+  mkdir -p "$root/a" "$root/b"
+  printf 'identical 39 bytes of fixture content..' > "$root/a/same.txt"
+  printf 'identical 39 bytes of fixture content..' > "$root/b/same.txt"
+
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -S -C >/dev/null \
+    || fail "tusc -d failed on duplicate-content batch"
+
+  # Both relpaths must be present in the upload-dir's .info files —
+  # i.e. each got its own POST and its own PATCH succeeded.
+  local n found
+  for n in dupes/a/same.txt dupes/b/same.txt; do
+    found=0
+    for info in "$UPLOAD_DIR"/*.info; do
+      grep -q "\"filename\":\"$n\"" "$info" && { found=1; break; }
+    done
+    [[ $found -eq 1 ]] || fail "duplicate-content file $n was not uploaded as its own object"
+  done
+}
+
 test_name_override() {
   local f="$WORK_DIR/named.bin"; local tdir="$WORK_DIR/name-cache"
   dd if=/dev/urandom of="$f" bs=1024 count=16 2>/dev/null
@@ -256,13 +281,16 @@ test_resume_announces_offset() {
     -H "Upload-Offset: 0" \
     -H "Upload-Checksum: sha256 $sum" \
     --data-binary "@$WORK_DIR/resume-chunk" -X PATCH "$loc" >/dev/null
-  # Seed the cache: hash key is sha256 of the file, host-key is sha1 of host+basepath.
+  # Seed the cache. The script's cache key is UPLOAD_KEY (= the same
+  # SUMALGO of "<content-hash>:<name>"), not the bare content hash.
   local key; key=$(sha256 "$f")
+  local upload_key
+  upload_key=$(printf '%s:%s' "$key" "resume.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
   local hostsha
   hostsha=$(printf %s "$TUSD_HOST:$TUSD_PORT/files/" \
     | (command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum -a 1) \
     | awk '{print $1}')
-  printf %s "$loc" > "$tdir/loc.$key.$hostsha"
+  printf %s "$loc" > "$tdir/loc.$upload_key.$hostsha"
 
   local out
   out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C)
@@ -331,13 +359,15 @@ test_head_5xx_surfaces_error() {
   start_stub_server "$port"
   local tdir="$WORK_DIR/head500-cache"; mkdir -p "$tdir"
   printf payload > "$WORK_DIR/head500.bin"
-  # Seed cache with a URL pointing at the stub so we go through the HEAD probe.
+  # Seed cache: cache key is UPLOAD_KEY = sha256("<content-hash>:<name>").
   local key; key=$(sha256 "$WORK_DIR/head500.bin")
+  local upload_key
+  upload_key=$(printf '%s:%s' "$key" "head500.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
   local hostsha
   hostsha=$(printf %s "127.0.0.1:$port/files/" \
     | (command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum -a 1) \
     | awk '{print $1}')
-  printf %s "http://127.0.0.1:$port/files/seeded" > "$tdir/loc.$key.$hostsha"
+  printf %s "http://127.0.0.1:$port/files/seeded" > "$tdir/loc.$upload_key.$hostsha"
 
   local out rc
   out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$WORK_DIR/head500.bin" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
@@ -370,6 +400,7 @@ run "cache-hit prints Already uploaded" test_cache_hit_message
 run "--force creates a fresh upload"   test_force_replaces_upload
 run "stale cache URL recovers"         test_stale_cache_url_recovers
 run "-d preserves relative paths in metadata" test_dir_upload_preserves_paths
+run "identical content at different paths uploads twice" test_identical_content_different_names
 run "-N override sets Upload-Metadata.filename" test_name_override
 run "resume announces byte offset"     test_resume_announces_offset
 run "shell-injection canary stays cold" test_shell_injection_canary

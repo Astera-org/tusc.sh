@@ -451,11 +451,25 @@ if [[ -z "$KEY" ]]; then
   no-spinner
   cache-checksum-set "$FILE:$MTIME" "$SUMALGO" "$KEY"
 fi
-[[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY"
+
+# The Upload-Key header we send (and the URL we cache against) must be
+# unique per (content, destination). If we used the bare content
+# digest, two distinct files with identical bytes — common with empty
+# placeholders, stub files, or fixture data — would collide: a
+# content-deduping server may hand the second POST back an
+# already-finalized upload id, causing the follow-up PATCH to fail
+# 404. Mix the destination name in so identical content at different
+# upload paths stays distinct, while a re-run of the same file at the
+# same path still keys identically and resumes.
+UPLOAD_KEY=$(printf '%s:%s' "$KEY" "$NAME" \
+  | (command -v "${SUMALGO}sum" >/dev/null 2>&1 && "${SUMALGO}sum" || shasum -a "${SUMALGO#sha}") \
+  | awk '{print $1}')
+
+[[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nUPLOAD_KEY: $UPLOAD_KEY"
 
 # head request
 BASEPATH=${BASEPATH:-/files/}
-TUSURL=$(locate "$HOST" "$BASEPATH" "$KEY")
+TUSURL=$(locate "$HOST" "$BASEPATH" "$UPLOAD_KEY")
 # --force ignores any cached upload URL so we always start a fresh POST.
 [[ $FORCE ]] && TUSURL=""
 [[ $LOCATE ]] && info "URL: $TUSURL" && [[ -n "$TUSURL" ]]; [[ $LOCATE ]] && exit $?
@@ -486,13 +500,13 @@ else
   # No Upload-Checksum on the POST: the create request has no body.
   request \
     -H "Upload-Length: $SIZE" \
-    -H "Upload-Key: $KEY" \
+    -H "Upload-Key: $UPLOAD_KEY" \
     -H "Upload-Metadata: $META" \
     -X POST "$HOST$BASEPATH"
 
   # save location config
   TUSURL=$(header "Location")
-  [[ $TUSURL ]] && cache-loc-set "$HOST$BASEPATH" "$KEY" "$TUSURL"
+  [[ $TUSURL ]] && cache-loc-set "$HOST$BASEPATH" "$UPLOAD_KEY" "$TUSURL"
 fi
 
 # curl's built-in progress meter does the job for the PATCH (visible in
@@ -518,9 +532,27 @@ PATCH_SUM=$(body-checksum-b64 "$SUMALGO" "$FILEPART")
 PATCH_ARGS+=(--upload-file "$FILEPART" --request PATCH "$TUSURL")
 request "${PATCH_ARGS[@]}" || error "Request failed" 1
 
-HEADER0=$HEADER HEADER=`mktemp -t tus.XXXXXXXXXX`
-while :; do
-  [[ $(header "Upload-Offset") -eq $SIZE ]] && exit
-  request --head "$TUSURL" > /dev/null
-  [[ $(header "Upload-Offset") -eq $SIZE ]] || sleep 2
+# tusd (and any spec-compliant server) returns the final Upload-Offset
+# in the PATCH 204 response. If we're already at SIZE, finish up; the
+# trap will report success from $OFFSET.
+PATCH_OFFSET=$(header "Upload-Offset")
+if [[ "$PATCH_OFFSET" == "$SIZE" ]]; then
+  OFFSET=$PATCH_OFFSET
+  exit 0
+fi
+
+# Fallback: some servers reply before fully committing. Poll HEAD until
+# the upload settles or we give up. `|| true` keeps `set -e` from
+# aborting the script silently when the server returns a non-2xx HEAD
+# (e.g. Astera's gateway returns 404 once an upload is finalized).
+HEADER0=$HEADER; HEADER=`mktemp -t tus.XXXXXXXXXX`
+for _ in $(seq 1 30); do
+  request --head "$TUSURL" > /dev/null || true
+  POLL_OFFSET=$(header "Upload-Offset")
+  if [[ "$POLL_OFFSET" == "$SIZE" ]]; then
+    OFFSET=$POLL_OFFSET
+    exit 0
+  fi
+  sleep 2
 done
+error "Upload did not finalize after polling" 1
