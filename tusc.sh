@@ -357,7 +357,13 @@ on-exit()
 {
   no-spinner
   if [[ $OFFSET ]]; then
-    OFFSET=$(header "Upload-Offset")  LEFTOVER=$((SIZE - ${OFFSET:-0}))
+    # Prefer Upload-Offset from the most recent response, but don't
+    # clobber a known-good $OFFSET when the response doesn't carry the
+    # header (e.g. tusd's 201 to a 0-byte POST has no Upload-Offset).
+    local hdr_offset
+    hdr_offset=$(header "Upload-Offset")
+    [[ -n "$hdr_offset" ]] && OFFSET=$hdr_offset
+    LEFTOVER=$((SIZE - ${OFFSET:-0}))
   fi
   rm -f -- "$FILEPART_TMP" "$HEADER0" "$HEADER"
   [[ $OFFSET ]] || return 0
@@ -519,6 +525,15 @@ else
   # save location config
   TUSURL=$(header "Location")
   [[ $TUSURL ]] && cache-loc-set "$HOST$BASEPATH" "$UPLOAD_KEY" "$TUSURL"
+
+  # 0-byte file: the POST already created the upload at its terminal
+  # state (Upload-Length: 0). Sending a follow-up PATCH with an empty
+  # body is wasteful and some servers reject it with 404 ("upload not
+  # found") because there's nothing left to write. Skip the PATCH.
+  if [[ $SIZE -eq 0 ]]; then
+    OFFSET=0
+    exit 0
+  fi
 fi
 
 # curl's built-in progress meter does the job for the PATCH (visible in

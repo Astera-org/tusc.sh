@@ -219,6 +219,24 @@ test_dir_upload_preserves_paths() {
   return 0
 }
 
+test_zero_byte_file() {
+  # 0-byte files: the POST creates the upload at its terminal state
+  # (Upload-Length: 0). The script must NOT send a follow-up empty
+  # PATCH — some servers reject it as 404 ERR_UPLOAD_NOT_FOUND.
+  local f="$WORK_DIR/empty.bin"; local tdir="$WORK_DIR/empty-cache"
+  : > "$f"
+  local out
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C) || {
+    fail "0-byte upload exited non-zero"; return 1; }
+  grep -q "Uploaded successfully" <<< "$out" || {
+    fail "0-byte upload didn't print success: $out"; return 1; }
+  local url; url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -S -C | extract_url)
+  [[ -n "$url" ]] || { fail "could not locate 0-byte upload"; return 1; }
+  curl -fsSL "$url" -o "$WORK_DIR/empty.dl"
+  local dl_size; dl_size=$(wc -c < "$WORK_DIR/empty.dl" | tr -d ' ')
+  [[ "$dl_size" == 0 ]] || { fail "downloaded empty upload was $dl_size bytes, expected 0"; return 1; }
+}
+
 test_resume_from_readonly_source_dir() {
   # Resume from a file whose containing directory is read-only must
   # not try to write a .part next to the source. The script stages
@@ -462,6 +480,7 @@ run "cache-hit prints Already uploaded" test_cache_hit_message
 run "--force creates a fresh upload"   test_force_replaces_upload
 run "stale cache URL recovers"         test_stale_cache_url_recovers
 run "-d preserves relative paths in metadata" test_dir_upload_preserves_paths
+run "0-byte file uploads cleanly (skips empty PATCH)" test_zero_byte_file
 run "resume works from read-only source directory" test_resume_from_readonly_source_dir
 run "path with spaces survives quoting"            test_path_with_spaces
 run "identical content at different paths uploads twice" test_identical_content_different_names
