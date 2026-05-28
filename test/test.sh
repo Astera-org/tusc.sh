@@ -219,6 +219,68 @@ test_dir_upload_preserves_paths() {
   return 0
 }
 
+test_resume_from_readonly_source_dir() {
+  # Resume from a file whose containing directory is read-only must
+  # not try to write a .part next to the source. The script stages
+  # the partial slice under $TUSDIR instead.
+  local rodir="$WORK_DIR/ro"; local tdir="$WORK_DIR/ro-cache"
+  mkdir -p "$rodir" "$tdir"
+  dd if=/dev/urandom of="$rodir/big.bin" bs=1024 count=1024 2>/dev/null   # 1 MiB
+  chmod 555 "$rodir"
+
+  # Seed a partial upload (256 KiB out of 1 MiB) and prime tusc's cache.
+  local size; size=$(wc -c < "$rodir/big.bin" | tr -d ' ')
+  local name_b64; name_b64=$(printf %s "big.bin" | base64 | tr -d '\n')
+  local hdr; hdr=$(mktemp -t ro-hdr.XXXXXX)
+  curl -fsSLD "$hdr" \
+    -H "Tus-Resumable: 1.0.0" \
+    -H "Upload-Length: $size" \
+    -H "Upload-Metadata: filename $name_b64" \
+    -X POST "http://$TUSD_HOST:$TUSD_PORT/files/" >/dev/null
+  local loc; loc=$(awk -F': ' 'tolower($1)=="location" {sub(/\r$/,"",$2); print $2; exit}' "$hdr")
+  rm -f "$hdr"
+  dd if="$rodir/big.bin" bs=1024 count=256 2>/dev/null > "$WORK_DIR/ro-chunk"
+  local sum; sum=$(openssl dgst -sha256 -binary "$WORK_DIR/ro-chunk" | base64 | tr -d '\n')
+  curl -fsSL \
+    -H "Tus-Resumable: 1.0.0" \
+    -H "Content-Type: application/offset+octet-stream" \
+    -H "Upload-Offset: 0" \
+    -H "Upload-Checksum: sha256 $sum" \
+    --data-binary "@$WORK_DIR/ro-chunk" -X PATCH "$loc" >/dev/null
+
+  local key; key=$(sha256 "$rodir/big.bin")
+  local upload_key
+  upload_key=$(printf '%s:%s' "$key" "big.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
+  local hostsha
+  hostsha=$(printf %s "$TUSD_HOST:$TUSD_PORT/files/" \
+    | (command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum -a 1) \
+    | awk '{print $1}')
+  printf %s "$loc" > "$tdir/loc.$upload_key.$hostsha"
+
+  local out rc
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$rodir/big.bin" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  chmod 755 "$rodir"   # restore for cleanup
+  [[ $rc -eq 0 ]] || fail "expected resume to succeed on read-only source dir; rc=$rc out=$out"
+  grep -q "Uploaded successfully" <<< "$out" || fail "no success message: $out"
+  # And no .part should be created next to the source.
+  [[ ! -e "$rodir/big.bin.part" ]] || fail ".part leaked next to source"
+}
+
+test_path_with_spaces() {
+  # File path with a space exercises every quoting hazard in the
+  # cleanup trap, metadata building, and curl invocation.
+  local f="$WORK_DIR/has space.bin"; local tdir="$WORK_DIR/space-cache"
+  dd if=/dev/urandom of="$f" bs=1024 count=32 2>/dev/null
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null \
+    || fail "upload failed for path with spaces"
+  local url
+  url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -S -C | extract_url)
+  [[ -n "$url" ]] || fail "could not locate upload of spaced-path file"
+  local got="$WORK_DIR/got.bin"
+  curl -fsSL "$url" -o "$got"
+  cmp -s "$f" "$got" || fail "spaced-path file bytes differ"
+}
+
 test_identical_content_different_names() {
   # Two files with identical bytes at different upload paths must
   # produce distinct uploads. Before Upload-Key was namespaced by the
@@ -400,6 +462,8 @@ run "cache-hit prints Already uploaded" test_cache_hit_message
 run "--force creates a fresh upload"   test_force_replaces_upload
 run "stale cache URL recovers"         test_stale_cache_url_recovers
 run "-d preserves relative paths in metadata" test_dir_upload_preserves_paths
+run "resume works from read-only source directory" test_resume_from_readonly_source_dir
+run "path with spaces survives quoting"            test_path_with_spaces
 run "identical content at different paths uploads twice" test_identical_content_different_names
 run "-N override sets Upload-Metadata.filename" test_name_override
 run "resume announces byte offset"     test_resume_announces_offset

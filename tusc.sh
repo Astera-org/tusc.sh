@@ -15,8 +15,14 @@
 
 if [[ -f $HOME/.tus.dbg ]]; then set -ex; else set -e; fi
 
-FULL=$(readlink -f $0) TUSC=$(basename $0) SPINID=0
-CURLARGS=()   # passthrough curl args captured after `--`
+# Resolve the script's own path with realpath (portable on macOS 12.3+
+# and Linux coreutils) rather than `readlink -f`, which BSD readlink
+# historically did not support.
+FULL=$(realpath "$0")
+TUSC=$(basename "$0")
+SPINID=0
+CURLARGS=()      # passthrough curl args captured after `--`
+FILEPART_TMP=""  # tracked here so on-exit can remove it even when interrupted
 
 ISOK=0    # is last request ok?
 STATUS=   # last response status code
@@ -83,7 +89,7 @@ update()
   [[ "v$NEWVER" == "$(version)" ]] && ok "Already latest version" 0
 
   info "Updating $TUSC ..."
-  curl -fsSLo ${FULL} https://raw.githubusercontent.com/Astera-org/tusc.sh/main/tusc.sh
+  curl -fsSLo "$FULL" https://raw.githubusercontent.com/Astera-org/tusc.sh/main/tusc.sh
   ok "  Done [${NEWVER}]"
 }
 
@@ -196,11 +202,17 @@ locate() # $1 = HOST, $2 = BASEPATH, $3 = key
   cache-loc-get "$1$2" "$3"
 }
 
-# create a part of file (portable: BSD dd has no iflag=skip_bytes)
+# Carve the tail of a file starting at byte offset $1 into a temp file
+# under $TUSDIR (a writable, per-user dir). We previously wrote
+# "$3.part" next to the source, which fails on read-only sources and
+# clobbers any existing .part file. Records the path in $FILEPART_TMP
+# so the EXIT trap can remove it even if we're interrupted.
 filepart() # $1 = start_byte, $2 = byte_length (unused; always remainder), $3 = file
 {
-  tail -c +"$(( $1 + 1 ))" "$3" > "$3.part"
-  realpath "$3.part"
+  ensure-tusdir
+  FILEPART_TMP=$(mktemp "$TUSDIR/part.XXXXXXXX")
+  tail -c +"$(( $1 + 1 ))" "$3" > "$FILEPART_TMP"
+  printf '%s\n' "$FILEPART_TMP"
 }
 
 # http request
@@ -347,7 +359,7 @@ on-exit()
   if [[ $OFFSET ]]; then
     OFFSET=$(header "Upload-Offset")  LEFTOVER=$((SIZE - ${OFFSET:-0}))
   fi
-  rm -f $FILE.part $HEADER0 $HEADER
+  rm -f -- "$FILEPART_TMP" "$HEADER0" "$HEADER"
   [[ $OFFSET ]] || return 0
 
   if [[ $LEFTOVER -eq 0 ]]; then
