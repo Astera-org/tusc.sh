@@ -430,6 +430,77 @@ test_checksum_cache_invalidates_on_size_change() {
     || { fail "downloaded content didn't match the new bytes (stale-cache hit)"; return 1; }
 }
 
+test_checksum_cache_invalidates_on_subsecond_rewrite() {
+  # Two rewrites within the same wall-second, same size, different
+  # bytes. Nanosecond-precision mtime in the cache key catches this;
+  # second-resolution mtime alone does not.
+  command -v openssl >/dev/null 2>&1 || { say "    skip: openssl needed"; return 0; }
+  local f="$WORK_DIR/subsec.bin"; local tdir="$WORK_DIR/subsec-cache"
+  mkdir -p "$tdir"
+  # Same 16-byte size, different content.
+  printf 'AAAAAAAAAAAAAAAA' > "$f"
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null
+  # Rewrite immediately; on a fast filesystem this lands in the same
+  # wall-second. Even if it doesn't, nanoseconds will differ.
+  printf 'BBBBBBBBBBBBBBBB' > "$f"
+  local out
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+    || { fail "second upload failed: $out"; return 1; }
+  local url
+  url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -S -C | extract_url)
+  curl -fsSL "$url" -o "$WORK_DIR/subsec.dl"
+  cmp -s "$f" "$WORK_DIR/subsec.dl" \
+    || { fail "downloaded bytes didn't match the new content (stale-cache hit)"; return 1; }
+}
+
+test_tusc_nocache_forces_rehash() {
+  # TUSC_NOCACHE=1 must bypass the checksum cache regardless of cache state.
+  local f="$WORK_DIR/nocache.bin"; local tdir="$WORK_DIR/nocache-cache"
+  printf 'hello' > "$f"
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null
+  # With TUSC_NOCACHE the DEBUG trace must show the hashing step
+  # ("> checksum sha256 ..."), which we suppress on cache hits.
+  local out
+  out=$(TUSDIR="$tdir" TUSC_NOCACHE=1 DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+    || { fail "TUSC_NOCACHE run failed: $out"; return 1; }
+  grep -q "^> checksum sha256" <<< "$out" \
+    || { fail "expected '> checksum sha256' in DEBUG trace under TUSC_NOCACHE=1; got: $out"; return 1; }
+}
+
+test_force_sends_fresh_upload_key() {
+  # --force must send a different Upload-Key on POST so a server that
+  # dedupes on it creates a new upload instead of returning the old
+  # URL. We can't ask tusd to dedup, so we inspect the DEBUG trace and
+  # confirm the Upload-Key sent under --force differs from the one
+  # sent on the unforced run.
+  local f="$WORK_DIR/forcekey.bin"; local tdir="$WORK_DIR/forcekey-cache"
+  printf 'forcekey-content' > "$f"
+  local out1 out2 k1 k2
+  out1=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+    || { fail "first upload failed: $out1"; return 1; }
+  out2=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C --force 2>&1) \
+    || { fail "forced upload failed: $out2"; return 1; }
+  # Extract the Upload-Key value from each POST trace (single line
+  # containing both -X POST and Upload-Key:\ <hex>).
+  k1=$(grep -- "-X POST" <<< "$out1" | grep -oE 'Upload-Key:[\\ ]*[a-f0-9-]+' | head -1)
+  k2=$(grep -- "-X POST" <<< "$out2" | grep -oE 'Upload-Key:[\\ ]*[a-f0-9-]+' | head -1)
+  [[ -n "$k1" && -n "$k2" ]] || { fail "could not find Upload-Key in POST trace; out1=$out1 out2=$out2"; return 1; }
+  [[ "$k1" != "$k2" ]] || { fail "--force used the same Upload-Key on POST ($k1)"; return 1; }
+}
+
+test_locate_requires_host() {
+  # --locate without --host has nothing to look up (cache is keyed by
+  # host+base-path). The script must reject it instead of pretending
+  # to print an empty URL.
+  local f="$WORK_DIR/loc-req.bin"
+  printf x > "$f"
+  local out rc
+  out=$(tusc -L -f "$f" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  [[ $rc -ne 0 ]] || { fail "--locate without --host unexpectedly succeeded: $out"; return 1; }
+  grep -q "host required" <<< "$out" \
+    || { fail "expected --host required error; got: $out"; return 1; }
+}
+
 test_upload_key_includes_basepath() {
   # Same file + same in-bucket name at two different --base-path
   # destinations must produce different uploads. Pre-fix UPLOAD_KEY
@@ -682,6 +753,10 @@ run "-d honors set -e inside the per-file subshell"       test_dir_set_e_honored
 run "-d forwards -- curl passthrough args to children" test_dir_forwards_curl_passthrough
 run "--creds file with only PASS is rejected"              test_creds_file_requires_both_user_and_pass
 run "checksum cache invalidates on size change"            test_checksum_cache_invalidates_on_size_change
+run "checksum cache invalidates on same-second rewrite"    test_checksum_cache_invalidates_on_subsecond_rewrite
+run "TUSC_NOCACHE bypasses the checksum cache"             test_tusc_nocache_forces_rehash
+run "--force sends a fresh Upload-Key on POST"             test_force_sends_fresh_upload_key
+run "--locate requires --host"                             test_locate_requires_host
 run "UPLOAD_KEY includes BASEPATH (no cross-bucket collide)" test_upload_key_includes_basepath
 run "-d manifest is cleaned up even on interrupt"          test_dir_manifest_cleaned_on_interrupt
 run "invalid --algo is rejected by whitelist"              test_invalid_algo_rejected

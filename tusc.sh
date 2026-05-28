@@ -28,13 +28,25 @@ MANIFEST_TMP=""  # dir-mode file list, removed by on-exit even when interrupted
 ISOK=0    # is last request ok?
 STATUS=   # last response status code
 
-# stat helpers (GNU vs BSD)
+# stat helpers (GNU vs BSD). fmtime_fine returns mtime with
+# nanosecond precision where the OS / filesystem supports it; we mix
+# it into the checksum cache key so a same-second rewrite of a file
+# (e.g. editor "save twice" within 1s, or `cp -p` preserving mtime
+# *and* size) still invalidates the cached digest.
 if stat -c %s /dev/null >/dev/null 2>&1; then
   fsize()  { stat -c %s "$1"; }
   fmtime() { stat -c %Y "$1"; }
+  fmtime_fine() {
+    # GNU stat: %y -> "YYYY-MM-DD HH:MM:SS.NNNNNNNNN ±HHMM"
+    local sec frac
+    sec=$(stat -c %Y "$1")
+    frac=$(stat -c %y "$1" | awk '{print $2}' | awk -F. '{print $2}')
+    printf '%s.%s' "$sec" "${frac:-0}"
+  }
 else
   fsize()  { stat -f %z "$1"; }
   fmtime() { stat -f %m "$1"; }
+  fmtime_fine() { stat -f %Fm "$1"; }   # BSD: "<seconds>.<nanoseconds>"
 fi
 
 # unwrapped base64 (BSD base64 has no -w, GNU wraps at 76 by default)
@@ -153,6 +165,7 @@ usage()
     $(info "DEBUG=1")        $(comment "Verbose curl + show debug headers on stderr.")
     $(info "TUSDIR")         $(comment "Cache dir for resume state and file checksums.")
                    $(comment "(Default: \$TMPDIR/tusc.<uid>/. Delete to force a fresh upload.)")
+    $(info "TUSC_NOCACHE=1") $(comment "Always re-hash the file; ignore the checksum cache.")
     $(info "TUSC_USER")      $(comment "Basic-auth username (alternative to --creds file).")
     $(info "TUSC_PASS")      $(comment "Basic-auth password (paired with TUSC_USER).")
 
@@ -454,7 +467,9 @@ elif [[ -n "${TUSC_USER:-}" && -n "${TUSC_PASS:-}" ]]; then
   CRED_PASS=$TUSC_PASS
   HAS_AUTH=1
 fi
-[[ $HOST ]] || [[ $LOCATE ]] || error "--host required" 1
+# --host is required even for --locate: lookup keys are namespaced by
+# host+base-path, so a hostless locate has nothing to look up.
+[[ $HOST ]] || error "--host required" 1
 [[ $FILE ]] || error "--file required" 1
 
 SUMALGO=${SUMALGO:-sha1}
@@ -488,12 +503,17 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
   HEADER=$(mktemp -t tus.XXXXXXXXXX)
 
   # File checksum: skip rehashing if we have it cached for this
-  # (path, mtime, size, algo) tuple. Size matters because a file can
-  # be rewritten with mtime preserved (e.g. `cp -p`, `tar -p`, atomic
-  # editor saves) — second-resolution mtime + path alone is not
-  # enough to guarantee the content hasn't changed.
-  CKEY="$FILE:$MTIME:$SIZE"
-  KEY=$(cache-checksum-get "$CKEY" "$SUMALGO")
+  # (path, nanosecond-mtime, size, algo) tuple. Both nanosecond mtime
+  # AND size are mixed in so a rewrite that preserves second-mtime
+  # *and* size (the rare edge case left after the size-in-key change)
+  # still has to match nanoseconds to hit. Set TUSC_NOCACHE=1 to force
+  # a fresh checksum every run.
+  CKEY="$FILE:$(fmtime_fine "$FILE"):$SIZE"
+  if [[ -n "${TUSC_NOCACHE:-}" ]]; then
+    KEY=""
+  else
+    KEY=$(cache-checksum-get "$CKEY" "$SUMALGO")
+  fi
   if [[ -z "$KEY" ]]; then
     [[ $DEBUG ]] && debug "> checksum $SUMALGO $FILE"
     spinner
@@ -514,7 +534,17 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
   [[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nUPLOAD_KEY: $UPLOAD_KEY"
 
   TUSURL=$(cache-loc-get "$HOST$BASEPATH" "$UPLOAD_KEY")
-  [[ $FORCE ]] && TUSURL=""
+
+  # --force needs to (a) ignore the cached URL and (b) send a fresh
+  # Upload-Key so a server that dedupes on it creates a new upload
+  # instead of handing back the existing one. POST_UPLOAD_KEY carries
+  # an extra nonce on force; the local cache (and resume on later
+  # non-force runs) still keys on the canonical UPLOAD_KEY.
+  POST_UPLOAD_KEY=$UPLOAD_KEY
+  if [[ $FORCE ]]; then
+    TUSURL=""
+    POST_UPLOAD_KEY="$UPLOAD_KEY-$(printf '%s%s%s' "$$" "$RANDOM" "$(date +%s%N 2>/dev/null || date +%s)" | hash_stdin_hex sha1 | cut -c1-16)"
+  fi
 
   if [[ $LOCATE ]]; then
     info "URL: $TUSURL"
@@ -548,7 +578,7 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
     # No Upload-Checksum on the POST: the create request has no body.
     request \
       -H "Upload-Length: $SIZE" \
-      -H "Upload-Key: $UPLOAD_KEY" \
+      -H "Upload-Key: $POST_UPLOAD_KEY" \
       -H "Upload-Metadata: $META" \
       -X POST "$HOST$BASEPATH"
 
