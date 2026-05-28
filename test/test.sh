@@ -558,6 +558,86 @@ test_dir_forwards_curl_passthrough() {
   [[ "$patch_seen" -ge 1 ]] || { fail "passthrough header missing from PATCH in: $out"; return 1; }
 }
 
+test_header_returns_final_response_after_redirect() {
+  # When the server 302s the POST to a different URL that then returns
+  # the real Location, header() must report the *final* response's
+  # Location — not the intermediate redirect's. curl writes every
+  # response's headers into the dump file.
+  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
+  local port=$((40000 + RANDOM % 10000))
+  cat > "$WORK_DIR/redir-stub.py" <<PY
+import http.server, socketserver, sys
+PORT = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        # Redirect once; curl -L will follow with another POST.
+        if self.path == "/files/":
+            self.send_response(307)
+            self.send_header("Location", "http://127.0.0.1:%d/v2/files/" % PORT)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        # Final POST: TUS 201 with the canonical upload URL.
+        self.send_response(201)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Location", "http://127.0.0.1:%d/v2/files/REAL-UPLOAD-ID" % PORT)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def do_PATCH(self):
+        body_len = int(self.headers.get("Content-Length", "0"))
+        if body_len: self.rfile.read(body_len)
+        self.send_response(204)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Upload-Offset", str(body_len))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a, **k): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
+    s.serve_forever()
+PY
+  python3 "$WORK_DIR/redir-stub.py" "$port" >/dev/null 2>&1 &
+  STUB_PID=$!
+  for _ in $(seq 1 50); do
+    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
+    sleep 0.05
+  done
+
+  local f="$WORK_DIR/redir.bin"; local tdir="$WORK_DIR/redir-cache"
+  printf 'redir-payload' > "$f"
+  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C >/dev/null 2>&1 || true
+  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+
+  # The cache must hold the FINAL URL, not the redirect target.
+  local cached
+  cached=$(cat "$tdir"/loc.* 2>/dev/null | head -1)
+  [[ "$cached" == *"REAL-UPLOAD-ID"* ]] \
+    || { fail "cached URL should be the final upload URL; got: $cached"; return 1; }
+}
+
+test_debug_masks_password_with_metacharacters() {
+  # DEBUG trace must mask the password even when it contains shell
+  # metachars. Pre-fix the script substituted the raw password into
+  # the post-quoted argv string, so e.g. "a b" — printed as "a\ b"
+  # by printf %q — slipped through unmasked.
+  local f="$WORK_DIR/maskmeta.bin"; local tdir="$WORK_DIR/maskmeta-cache"
+  dd if=/dev/urandom of="$f" bs=1024 count=4 2>/dev/null
+  local pw='p w$x"y'   # space + $ + " — all need shell escaping
+  local out
+  out=$(TUSDIR="$tdir" TUSC_USER=alice TUSC_PASS="$pw" DEBUG=1 \
+        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+    || { fail "debug-mask upload failed: $out"; return 1; }
+  # printf %q escapes *, so the trace shows alice:\*\*\* — strip the
+  # backslashes before checking the masked form is present.
+  grep -qF -- "--user alice:***" <<< "${out//\\/}" \
+    || { fail "expected 'alice:***' in DEBUG output; got: $out"; return 1; }
+  # The literal password must NOT appear anywhere in the transcript.
+  if grep -qF -- "$pw" <<< "$out"; then
+    fail "password '$pw' leaked into DEBUG output: $out"
+    return 1
+  fi
+}
+
 test_env_var_credentials() {
   # TUSC_USER + TUSC_PASS in the env populate basic auth without a
   # file. Verify by greppin the masked --user line out of DEBUG output.
@@ -567,7 +647,9 @@ test_env_var_credentials() {
   out=$(TUSDIR="$tdir" TUSC_USER=alice TUSC_PASS=secret DEBUG=1 \
         tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
     || { fail "env-auth upload failed: $out"; return 1; }
-  grep -q -- "--user alice:\\*\\*\\*" <<< "$out" \
+  # printf %q escapes the * characters, so the trace shows
+  # `--user alice:\*\*\*`. Strip backslashes before grepping.
+  grep -qF -- "--user alice:***" <<< "${out//\\/}" \
     || { fail "expected --user alice:*** in DEBUG output (env creds not picked up); got: $out"; return 1; }
   grep -q "Uploaded successfully" <<< "$out" \
     || { fail "env-auth upload did not print success: $out"; return 1; }
@@ -599,7 +681,7 @@ test_resume_announces_offset() {
     -H "Upload-Offset: 0" \
     -H "Upload-Checksum: sha256 $sum" \
     --data-binary "@$WORK_DIR/resume-chunk" -X PATCH "$loc" >/dev/null
-  # Seed the cache. UPLOAD_KEY = SUMALGO of "<content>:<basepath>:<name>".
+  # Seed the cache. UPLOAD_KEY = SUMALGO("<content>:<host>:<basepath>:<name>").
   local key; key=$(sha256 "$f")
   local upload_key
   upload_key=$(printf '%s:%s:%s:%s' "$key" "$TUSD_HOST:$TUSD_PORT" "/files/" "resume.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
@@ -676,7 +758,7 @@ test_head_5xx_surfaces_error() {
   start_stub_server "$port"
   local tdir="$WORK_DIR/head500-cache"; mkdir -p "$tdir"
   printf payload > "$WORK_DIR/head500.bin"
-  # Seed cache: UPLOAD_KEY = sha256("<content>:<basepath>:<name>").
+  # Seed cache: UPLOAD_KEY = sha256("<content>:<host>:<basepath>:<name>").
   local key; key=$(sha256 "$WORK_DIR/head500.bin")
   local upload_key
   upload_key=$(printf '%s:%s:%s:%s' "$key" "127.0.0.1:$port" "/files/" "head500.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
@@ -734,6 +816,8 @@ run "--locate requires --host"                             test_locate_requires_
 run "UPLOAD_KEY differs across host and base-path"          test_upload_key_includes_destination
 run "-d manifest is cleaned up even on interrupt"          test_dir_manifest_cleaned_on_interrupt
 run "invalid --algo is rejected by whitelist"              test_invalid_algo_rejected
+run "header() returns final response Location after redirect" test_header_returns_final_response_after_redirect
+run "DEBUG masks passwords with shell metacharacters"      test_debug_masks_password_with_metacharacters
 run "TUSC_USER/TUSC_PASS env creds are honored" test_env_var_credentials
 run "resume announces byte offset"     test_resume_announces_offset
 run "shell-injection canary stays cold" test_shell_injection_canary

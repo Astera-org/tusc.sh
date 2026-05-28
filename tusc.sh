@@ -283,10 +283,20 @@ request()
   cmd+=("$@")
 
   if [[ $DEBUG ]]; then
-    local pretty
-    pretty=$(printf '%q ' "${cmd[@]}")
-    [[ $HAS_AUTH ]] && pretty=${pretty//$CRED_PASS/***}
-    debug "> $pretty"
+    # Mask the password BEFORE shell-quoting. Doing it after `printf %q`
+    # misses passwords with metacharacters (`a b` becomes `a\ b`, etc.)
+    # — the raw substring wouldn't match the quoted form.
+    local cmd_disp i
+    cmd_disp=("${cmd[@]}")
+    if [[ $HAS_AUTH ]]; then
+      for (( i=0; i < ${#cmd_disp[@]} - 1; i++ )); do
+        if [[ "${cmd_disp[i]}" == "--user" ]]; then
+          cmd_disp[i+1]="$CRED_USER:***"
+          break
+        fi
+      done
+    fi
+    debug "> $(printf '%q ' "${cmd_disp[@]}")"
   fi
 
   # For PATCH and DEBUG, let stderr flow to the terminal (progress meter
@@ -325,13 +335,17 @@ request()
   return $RET
 }
 
-# http response header (case-insensitive lookup against the raw header file)
+# http response header (case-insensitive lookup against the raw header
+# file). curl -L writes the headers of *every* response in a redirect
+# chain into the dump file. We want the value from the final response
+# only — reset state at each `HTTP/...` line so a redirect's
+# `Location: <intermediate>` doesn't shadow the final TUS upload URL.
 header() # $1 = key
 {
   [[ -f "$HEADER" ]] || return 0
   awk -v k="$1" '
-    BEGIN { k = tolower(k) }
-    /^HTTP\// { next }
+    BEGIN { k = tolower(k); val = "" }
+    /^HTTP\// { val = ""; next }
     {
       sub(/\r$/, "")
       i = index($0, ":")
@@ -339,8 +353,9 @@ header() # $1 = key
       n = substr($0, 1, i - 1)
       v = substr($0, i + 1)
       sub(/^ +/, "", v)
-      if (tolower(n) == k) { print v; exit }
+      if (tolower(n) == k) val = v
     }
+    END { print val }
   ' "$HEADER"
 }
 
@@ -378,11 +393,9 @@ no-spinner()
   printf '\r  \r' >&2
 }
 
-# Print "uploaded" / "already uploaded" + URL. Called inline from
-# upload_one's success paths so reporting doesn't depend on the EXIT
-# trap firing — which it doesn't, for `(subshell)` invocations in
-# bash. Sets REPORTED=1 so the trap below knows we've already had our
-# say and shouldn't add an "Unfinished upload" message on top.
+# Print the success line + URL inline. Sets REPORTED=1 so on-exit
+# doesn't add an "Unfinished upload" hint on top. (See the dir-mode
+# block below for why this is inline and not in the EXIT trap.)
 report_success()
 {
   REPORTED=1
@@ -394,23 +407,19 @@ report_success()
   info "URL: $TUSURL"
 }
 
-# EXIT trap: clean up tempfiles, and — if we were mid-upload but never
-# called report_success — print an "interrupted, please resume" hint.
-# Reporting on success is intentionally NOT done here; bash does not
-# inherit the parent's EXIT trap into a `(...)` subshell, so anything
-# we tried to print here would silently disappear in dir mode.
+# EXIT trap: clean up tempfiles + print an "interrupted, please
+# resume" hint if upload_one didn't get to report_success first.
 on-exit()
 {
   no-spinner
   rm -f -- "$FILEPART_TMP" "$MANIFEST_TMP" "$HEADER0" "$HEADER" 2>/dev/null
   [[ $REPORTED ]] && return 0
   [[ -z "${OFFSET:-}" ]] && return 0
-  # Mid-upload exit without a success report — most likely Ctrl-C or a
-  # signal. Use line() directly with no exit code so we don't override
-  # whatever code the shell is exiting with.
-  local hdr_offset
-  hdr_offset=$(header "Upload-Offset")
-  [[ -n "$hdr_offset" ]] && OFFSET=$hdr_offset
+  # Mid-upload exit without a success report — most likely Ctrl-C or
+  # a signal. The pre-trap $OFFSET already reflects whatever
+  # upload_one had reached; don't try to re-read from $HEADER (we
+  # just deleted it above) — use line() with no exit code so the
+  # script's existing exit status survives.
   if [[ $((SIZE - ${OFFSET:-0})) -gt 0 ]]; then
     line "✖ Unfinished upload, please rerun the command to resume." 31 0 "" 2
     [[ -n "${TUSURL:-}" ]] && line "URL: $TUSURL" 33 0 "" 2
@@ -478,18 +487,9 @@ esac
 
 BASEPATH=${BASEPATH:-/files/}
 
-# Per-file upload body. Reads HOST, BASEPATH, HAS_AUTH/CRED_USER/CRED_PASS,
-# FORCE, LOCATE, SUMALGO, CURLARGS, DEBUG, NOCOLOR, NOSPIN, and the
-# various helper functions from the enclosing script.
-#
-# Reporting model: success paths call `report_success` explicitly,
-# which both prints "✔ Uploaded successfully!" / "ℹ Already uploaded"
-# + URL and sets REPORTED=1. The EXIT trap is *only* for cleanup of
-# tempfiles plus an "Unfinished upload, please rerun..." hint when
-# the script exited mid-upload (Ctrl-C / signal) without reporting.
-# We don't rely on the trap for success because bash doesn't inherit
-# the parent EXIT trap into a `(subshell)`; dir-mode re-installs the
-# trap inside its per-file subshell so cleanup still fires there.
+# Per-file upload body. Success paths call report_success inline;
+# the EXIT trap handles cleanup and the interrupted-resume hint.
+# See the dir-mode block below for the subshell rationale.
 upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
 {
   FILE=$1
