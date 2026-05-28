@@ -22,7 +22,8 @@ FULL=$(realpath "$0")
 TUSC=$(basename "$0")
 SPINID=0
 CURLARGS=()      # passthrough curl args captured after `--`
-FILEPART_TMP=""  # tracked here so on-exit can remove it even when interrupted
+FILEPART_TMP=""  # per-upload tempfile, removed by on-exit even when interrupted
+MANIFEST_TMP=""  # dir-mode file list, removed by on-exit even when interrupted
 
 ISOK=0    # is last request ok?
 STATUS=   # last response status code
@@ -180,14 +181,16 @@ fi
 # Hash an arbitrary string to a hex digest, for use as a filename.
 strhash() { printf %s "$1" | hash_stdin_hex sha1; }
 
-# Cached file checksum (skip rehashing on resume).
-cache-checksum-get() # $1 = "<file>:<mtime>", $2 = algo
+# Cached file checksum (skip rehashing on resume). Key is opaque
+# from the helper's perspective; callers compose path+mtime+size so a
+# mtime-preserving rewrite (different size) invalidates the entry.
+cache-checksum-get() # $1 = cache key string, $2 = algo
 {
   local f="$TUSDIR/ck.$(strhash "$1").$2"
   [[ -f "$f" ]] && cat "$f"
   return 0
 }
-cache-checksum-set() # $1 = "<file>:<mtime>", $2 = algo, $3 = hex digest
+cache-checksum-set() # $1 = cache key string, $2 = algo, $3 = hex digest
 {
   ensure-tusdir
   printf %s "$3" > "$TUSDIR/ck.$(strhash "$1").$2"
@@ -388,7 +391,7 @@ report_success()
 on-exit()
 {
   no-spinner
-  rm -f -- "$FILEPART_TMP" "$HEADER0" "$HEADER" 2>/dev/null
+  rm -f -- "$FILEPART_TMP" "$MANIFEST_TMP" "$HEADER0" "$HEADER" 2>/dev/null
   [[ $REPORTED ]] && return 0
   [[ -z "${OFFSET:-}" ]] && return 0
   # Mid-upload exit without a success report — most likely Ctrl-C or a
@@ -462,11 +465,18 @@ esac
 
 BASEPATH=${BASEPATH:-/files/}
 
-# Per-file upload body. Reads HOST, BASEPATH, CREDS/HAS_AUTH, FORCE,
-# LOCATE, SUMALGO, CURLARGS, DEBUG, NOCOLOR, NOSPIN, and the various
-# helper functions from the enclosing script. Writes its outcome via
-# the EXIT trap; for dir-mode this function is invoked in a subshell
-# per file so the trap fires (and reports / cleans up) once per file.
+# Per-file upload body. Reads HOST, BASEPATH, HAS_AUTH/CRED_USER/CRED_PASS,
+# FORCE, LOCATE, SUMALGO, CURLARGS, DEBUG, NOCOLOR, NOSPIN, and the
+# various helper functions from the enclosing script.
+#
+# Reporting model: success paths call `report_success` explicitly,
+# which both prints "✔ Uploaded successfully!" / "ℹ Already uploaded"
+# + URL and sets REPORTED=1. The EXIT trap is *only* for cleanup of
+# tempfiles plus an "Unfinished upload, please rerun..." hint when
+# the script exited mid-upload (Ctrl-C / signal) without reporting.
+# We don't rely on the trap for success because bash doesn't inherit
+# the parent EXIT trap into a `(subshell)`; dir-mode re-installs the
+# trap inside its per-file subshell so cleanup still fires there.
 upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
 {
   FILE=$1
@@ -478,21 +488,28 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
   HEADER=$(mktemp -t tus.XXXXXXXXXX)
 
   # File checksum: skip rehashing if we have it cached for this
-  # (path, mtime, algo) tuple.
-  KEY=$(cache-checksum-get "$FILE:$MTIME" "$SUMALGO")
+  # (path, mtime, size, algo) tuple. Size matters because a file can
+  # be rewritten with mtime preserved (e.g. `cp -p`, `tar -p`, atomic
+  # editor saves) — second-resolution mtime + path alone is not
+  # enough to guarantee the content hasn't changed.
+  CKEY="$FILE:$MTIME:$SIZE"
+  KEY=$(cache-checksum-get "$CKEY" "$SUMALGO")
   if [[ -z "$KEY" ]]; then
     [[ $DEBUG ]] && debug "> checksum $SUMALGO $FILE"
     spinner
     KEY=$(hash_file_hex "$SUMALGO" "$FILE")
     no-spinner
-    cache-checksum-set "$FILE:$MTIME" "$SUMALGO" "$KEY"
+    cache-checksum-set "$CKEY" "$SUMALGO" "$KEY"
   fi
 
-  # Mix the destination name into the Upload-Key so two distinct files
-  # with identical bytes at different upload paths don't collide on a
-  # content-deduping server. Re-uploading the same file at the same
-  # path still keys identically (resume works).
-  UPLOAD_KEY=$(printf '%s:%s' "$KEY" "$NAME" | hash_stdin_hex "$SUMALGO")
+  # Upload-Key must be unique per (content, destination). The
+  # destination here is the *full* destination — host, base-path, and
+  # in-bucket name. Mixing only content + name would still let two
+  # uploads collide on a server that honors Upload-Key when they share
+  # the file/name pair but differ on base-path (different bucket or
+  # tenant subtree). Re-running the same upload to the same
+  # host+basepath+name still keys identically, so resume works.
+  UPLOAD_KEY=$(printf '%s:%s:%s' "$KEY" "$BASEPATH" "$NAME" | hash_stdin_hex "$SUMALGO")
 
   [[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nUPLOAD_KEY: $UPLOAD_KEY"
 
@@ -610,12 +627,14 @@ if [[ $DIRMODE ]]; then
   ROOT_NAME=$(basename "$ROOT")
 
   # Single-pass: snapshot the file list into a manifest, count from
-  # it, iterate from it. Saves walking the tree twice.
+  # it, iterate from it. Saves walking the tree twice. Tracked in the
+  # global MANIFEST_TMP so the EXIT trap removes it even if the user
+  # Ctrl-Cs out of the upload loop.
   ensure-tusdir
-  MANIFEST=$(mktemp "$TUSDIR/manifest.XXXXXXXX")
-  find "$ROOT" -type f -print0 | LC_ALL=C sort -z > "$MANIFEST"
-  total=$(tr -dc '\0' < "$MANIFEST" | wc -c | tr -d ' ')
-  [[ $total -eq 0 ]] && { rm -f -- "$MANIFEST"; error "no files under '$ROOT'" 1; }
+  MANIFEST_TMP=$(mktemp "$TUSDIR/manifest.XXXXXXXX")
+  find "$ROOT" -type f -print0 | LC_ALL=C sort -z > "$MANIFEST_TMP"
+  total=$(tr -dc '\0' < "$MANIFEST_TMP" | wc -c | tr -d ' ')
+  [[ $total -eq 0 ]] && error "no files under '$ROOT'" 1
   info "Uploading $total file(s) from $ROOT (as $ROOT_NAME/...)"
 
   idx=0 fails=0
@@ -628,8 +647,7 @@ if [[ $DIRMODE ]]; then
     rc=$?
     set -e
     [[ $rc -ne 0 ]] && fails=$((fails+1))
-  done < "$MANIFEST"
-  rm -f -- "$MANIFEST"
+  done < "$MANIFEST_TMP"
 
   [[ $fails -gt 0 ]] && error "$fails file(s) failed to upload" 1
   ok "✔ $total file(s) uploaded from $ROOT"
