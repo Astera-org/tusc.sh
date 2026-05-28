@@ -41,21 +41,34 @@ b64() { base64 | tr -d '\n'; }
 
 # Hex-digest helpers. Prefer `<algo>sum` (Linux) and fall back to
 # `shasum -a <N>` (macOS, ships shasum but not sha1sum/sha256sum).
+# Both helpers capture the digest command's full output, return non-zero
+# if the command failed or produced no digest, and print the hex on
+# stdout. Don't pipe into awk inside the function: awk masks the
+# upstream command's failure under non-pipefail bash, and an unknown
+# algorithm would silently yield an empty digest.
 hash_file_hex() # $1 = algo (sha1|sha256|...), $2 = file -> "<hex>"
 {
+  local out
   if command -v "${1}sum" >/dev/null 2>&1; then
-    "${1}sum" "$2"
+    out=$("${1}sum" "$2") || return 1
   else
-    shasum -a "${1#sha}" "$2"
-  fi | awk '{print $1}'
+    out=$(shasum -a "${1#sha}" "$2") || return 1
+  fi
+  out=${out%% *}
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
 }
 hash_stdin_hex() # $1 = algo, reads stdin -> "<hex>"
 {
+  local out
   if command -v "${1}sum" >/dev/null 2>&1; then
-    "${1}sum"
+    out=$("${1}sum") || return 1
   else
-    shasum -a "${1#sha}"
-  fi | awk '{print $1}'
+    out=$(shasum -a "${1#sha}") || return 1
+  fi
+  out=${out%% *}
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
 }
 
 # Base64-of-raw-digest for the TUS Upload-Checksum header. Per
@@ -82,7 +95,7 @@ line() {
   fi
   [[ "$4" == "" ]] || exit $4
 }
-error()   { line "$1" 31 0 "$2" 2; }    # red,  stderr
+error()   { REPORTED=1; line "$1" 31 0 "$2" 2; }    # red,  stderr; suppresses trap's "unfinished" hint
 ok()      { line "${1:-  Done}" 32 0 "$2"; }
 info()    { line "$1" 33 0 "$2"; }
 comment() { line "$1" 30 1 "$2"; }      # dim,  stdout (used to render --help text)
@@ -249,7 +262,7 @@ request()
     cmd+=(-sS)
   fi
   cmd+=(-L -D "$HEADER" -H "Tus-Resumable: 1.0.0")
-  [[ $HAS_AUTH ]] && cmd+=(--basic --user "$USER:$PASS")
+  [[ $HAS_AUTH ]] && cmd+=(--basic --user "$CRED_USER:$CRED_PASS")
   # CURLARGS is a user-supplied passthrough captured as an array from
   # the "--" sentinel during argv parsing. Safe to splat directly.
   [[ ${#CURLARGS[@]} -gt 0 ]] && cmd+=("${CURLARGS[@]}")
@@ -258,7 +271,7 @@ request()
   if [[ $DEBUG ]]; then
     local pretty
     pretty=$(printf '%q ' "${cmd[@]}")
-    [[ $HAS_AUTH ]] && pretty=${pretty//$PASS/***}
+    [[ $HAS_AUTH ]] && pretty=${pretty//$CRED_PASS/***}
     debug "> $pretty"
   fi
 
@@ -351,32 +364,43 @@ no-spinner()
   printf '\r  \r' >&2
 }
 
-# exit handler
+# Print "uploaded" / "already uploaded" + URL. Called inline from
+# upload_one's success paths so reporting doesn't depend on the EXIT
+# trap firing — which it doesn't, for `(subshell)` invocations in
+# bash. Sets REPORTED=1 so the trap below knows we've already had our
+# say and shouldn't add an "Unfinished upload" message on top.
+report_success()
+{
+  REPORTED=1
+  if [[ $SKIPPED ]]; then
+    ok "ℹ Already uploaded — skipping (re-run with --force to overwrite)."
+  else
+    ok "✔ Uploaded successfully!"
+  fi
+  info "URL: $TUSURL"
+}
+
+# EXIT trap: clean up tempfiles, and — if we were mid-upload but never
+# called report_success — print an "interrupted, please resume" hint.
+# Reporting on success is intentionally NOT done here; bash does not
+# inherit the parent's EXIT trap into a `(...)` subshell, so anything
+# we tried to print here would silently disappear in dir mode.
 on-exit()
 {
   no-spinner
-  if [[ $OFFSET ]]; then
-    # Prefer Upload-Offset from the most recent response, but don't
-    # clobber a known-good $OFFSET when the response doesn't carry the
-    # header (e.g. tusd's 201 to a 0-byte POST has no Upload-Offset).
-    local hdr_offset
-    hdr_offset=$(header "Upload-Offset")
-    [[ -n "$hdr_offset" ]] && OFFSET=$hdr_offset
-    LEFTOVER=$((SIZE - ${OFFSET:-0}))
+  rm -f -- "$FILEPART_TMP" "$HEADER0" "$HEADER" 2>/dev/null
+  [[ $REPORTED ]] && return 0
+  [[ -z "${OFFSET:-}" ]] && return 0
+  # Mid-upload exit without a success report — most likely Ctrl-C or a
+  # signal. Use line() directly with no exit code so we don't override
+  # whatever code the shell is exiting with.
+  local hdr_offset
+  hdr_offset=$(header "Upload-Offset")
+  [[ -n "$hdr_offset" ]] && OFFSET=$hdr_offset
+  if [[ $((SIZE - ${OFFSET:-0})) -gt 0 ]]; then
+    line "✖ Unfinished upload, please rerun the command to resume." 31 0 "" 2
+    [[ -n "${TUSURL:-}" ]] && line "URL: $TUSURL" 33 0 "" 2
   fi
-  rm -f -- "$FILEPART_TMP" "$HEADER0" "$HEADER"
-  [[ $OFFSET ]] || return 0
-
-  if [[ $LEFTOVER -eq 0 ]]; then
-    if [[ $SKIPPED ]]; then
-      ok "ℹ Already uploaded — skipping (re-run with --force to overwrite)."
-    else
-      ok "✔ Uploaded successfully!"
-    fi
-  else
-    error "✖ Unfinished upload, please rerun the command to resume." 1
-  fi
-  info "URL: $TUSURL"
 }
 
 # argv parsing
@@ -406,23 +430,35 @@ done
 
 # Credentials: prefer --creds <file>; fall back to TUSC_USER+TUSC_PASS
 # env vars so callers can avoid putting secrets on disk. HAS_AUTH is
-# the script-internal flag the rest of the code checks; CREDS stays
-# meaning "a creds file path was given" so the dir-mode re-exec
-# doesn't try to propagate a fake path. Env vars are inherited by
-# children automatically.
+# the internal flag the rest of the code checks. Use CRED_USER /
+# CRED_PASS internally rather than USER/PASS so we don't authenticate
+# as the shell's $USER if a creds file forgot to set its own.
 if [[ $CREDS ]]; then
-  [[ -f $CREDS ]] && source $CREDS && [[ $PASS ]] || error "--creds file couldn't be loaded" 1
+  [[ -f "$CREDS" ]] || error "--creds file '$CREDS' not found" 1
+  # Blank USER/PASS first so we can detect a creds file that supplies
+  # only one of them — otherwise the shell's ambient $USER would
+  # silently stand in for a missing username.
+  USER="" PASS=""
+  # shellcheck disable=SC1090
+  source "$CREDS"
+  [[ -n "$USER" && -n "$PASS" ]] \
+    || error "--creds file '$CREDS' must set both USER and PASS" 1
+  CRED_USER=$USER
+  CRED_PASS=$PASS
   HAS_AUTH=1
 elif [[ -n "${TUSC_USER:-}" && -n "${TUSC_PASS:-}" ]]; then
-  USER=$TUSC_USER
-  PASS=$TUSC_PASS
+  CRED_USER=$TUSC_USER
+  CRED_PASS=$TUSC_PASS
   HAS_AUTH=1
 fi
 [[ $HOST ]] || [[ $LOCATE ]] || error "--host required" 1
 [[ $FILE ]] || error "--file required" 1
 
 SUMALGO=${SUMALGO:-sha1}
-[[ $SUMALGO == "sha"* ]] || error "--algo '$SUMALGO' not supported" 1
+case "$SUMALGO" in
+  sha1|sha224|sha256|sha384|sha512) ;;
+  *) error "--algo '$SUMALGO' not supported (use sha1|sha224|sha256|sha384|sha512)" 1 ;;
+esac
 
 BASEPATH=${BASEPATH:-/files/}
 
@@ -465,6 +501,7 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
 
   if [[ $LOCATE ]]; then
     info "URL: $TUSURL"
+    REPORTED=1
     [[ -n "$TUSURL" ]] && exit 0 || exit 1
   fi
 
@@ -476,7 +513,11 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
   FILEPART=$FILE
   if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
     OFFSET=$(header "Upload-Offset") LEFTOVER=$((SIZE - OFFSET))
-    [[ $LEFTOVER -eq 0 ]] && SKIPPED=1 && exit 0
+    if [[ $LEFTOVER -eq 0 ]]; then
+      SKIPPED=1
+      report_success
+      exit 0
+    fi
     if [[ $OFFSET -gt 0 ]]; then
       PCT=$(( OFFSET * 100 / SIZE ))
       info "↻ Resuming at byte $OFFSET / $SIZE (${PCT}%)"
@@ -486,7 +527,7 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
   else
     OFFSET=0 LEFTOVER=$SIZE
     META="filename $(printf %s "$NAME" | b64)"
-    [[ $HAS_AUTH ]] && META="$META,user $(printf %s "$USER" | b64)"
+    [[ $HAS_AUTH ]] && META="$META,user $(printf %s "$CRED_USER" | b64)"
     # No Upload-Checksum on the POST: the create request has no body.
     request \
       -H "Upload-Length: $SIZE" \
@@ -501,6 +542,7 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
     # empty PATCH — some servers reject it with 404.
     if [[ $SIZE -eq 0 ]]; then
       OFFSET=0
+      report_success
       exit 0
     fi
   fi
@@ -526,6 +568,7 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
   PATCH_OFFSET=$(header "Upload-Offset")
   if [[ "$PATCH_OFFSET" == "$SIZE" ]]; then
     OFFSET=$PATCH_OFFSET
+    report_success
     exit 0
   fi
 
@@ -537,6 +580,7 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
     POLL_OFFSET=$(header "Upload-Offset")
     if [[ "$POLL_OFFSET" == "$SIZE" ]]; then
       OFFSET=$POLL_OFFSET
+      report_success
       exit 0
     fi
     sleep 2
@@ -546,14 +590,19 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
 
 trap on-exit EXIT
 
-# Directory mode: walk the tree and call upload_one per file in a
-# subshell so each file's trap fires independently (per-file success
-# message, per-file cleanup) and a failed upload doesn't abort the
-# batch. The source directory's basename becomes the first path
-# segment of every Upload-Metadata.filename so the directory itself
-# materializes at the destination. CURLARGS, env-creds, and every
-# other global are inherited by the subshell — no argv reconstruction
-# needed.
+# Directory mode: walk the tree and run upload_one per file in an
+# explicit subshell. Two bash gotchas drive the unusual call pattern:
+#
+#   1. The parent's EXIT trap is NOT inherited into a `(...)` subshell,
+#      so we re-install it inside the subshell to keep per-file
+#      cleanup (rm tempfiles) and the interrupted-upload message.
+#   2. `( ... ) || handler` disables `set -e` *inside* the subshell —
+#      plain command failures would continue past instead of aborting.
+#      We avoid the `||` and capture $? via `set +e` / `set -e` so the
+#      subshell runs with `set -e` honored.
+#
+# CURLARGS, HAS_AUTH, the cred values, and all the helper functions
+# are inherited by the subshell — no argv reconstruction needed.
 if [[ $DIRMODE ]]; then
   ROOT=$(realpath "$FILE") || error "--file '$FILE' not found" 1
   [[ -d "$ROOT" ]] || error "--file must be a directory when -d/--dir is given" 1
@@ -574,7 +623,11 @@ if [[ $DIRMODE ]]; then
     idx=$((idx+1))
     rel="$ROOT_NAME/${f#$ROOT/}"
     info "[$idx/$total] $rel"
-    ( upload_one "$f" "$rel" ) || fails=$((fails+1))
+    set +e
+    ( set -e; trap on-exit EXIT; upload_one "$f" "$rel" )
+    rc=$?
+    set -e
+    [[ $rc -ne 0 ]] && fails=$((fails+1))
   done < "$MANIFEST"
   rm -f -- "$MANIFEST"
 

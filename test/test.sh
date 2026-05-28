@@ -335,6 +335,79 @@ test_name_override() {
   [[ $found -eq 1 ]] || fail "Upload-Metadata.filename did not honor --name override"
 }
 
+test_dir_per_file_success_and_cleanup() {
+  # Each file in dir mode must print its own "Uploaded successfully!"
+  # + URL — the EXIT trap is not inherited into `(subshell)` in bash,
+  # so reporting has to be explicit. Also verify no part.* tempfiles
+  # leak in $TUSDIR after a clean batch.
+  local root="$WORK_DIR/perfile"; local tdir="$WORK_DIR/perfile-cache"
+  mkdir -p "$root/a"
+  echo aaa > "$root/x.txt"
+  echo bbb > "$root/a/y.txt"
+  local out
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -S -C) \
+    || { fail "dir upload failed: $out"; return 1; }
+  local upcount
+  upcount=$(grep -c "Uploaded successfully" <<< "$out")
+  [[ "$upcount" == 2 ]] \
+    || { fail "expected 2 per-file 'Uploaded successfully' lines, got $upcount in: $out"; return 1; }
+  local urlcount
+  urlcount=$(grep -c "^URL: " <<< "$out")
+  [[ "$urlcount" == 2 ]] \
+    || { fail "expected 2 per-file URL lines, got $urlcount in: $out"; return 1; }
+  # No part.* leftovers in cache.
+  local leaks
+  leaks=$(find "$tdir" -name 'part.*' 2>/dev/null | wc -l | tr -d ' ')
+  [[ "$leaks" == 0 ]] || { fail "part.* tempfile(s) leaked: $leaks"; return 1; }
+}
+
+test_dir_set_e_honored_inside_subshell() {
+  # `( cmd ) || handler` disables set -e *inside* the subshell — plain
+  # command failures would continue past instead of aborting. The
+  # dir-mode driver must capture status without using ||, otherwise a
+  # transient failure mid-upload_one would silently keep running.
+  # We exercise this by pointing one of the children at an unreachable
+  # port: the connect failure must trip error() and the child must
+  # exit non-zero (not fall through and report success).
+  local root="$WORK_DIR/seteset"; local tdir="$WORK_DIR/seteset-cache"
+  mkdir -p "$root"
+  echo aaa > "$root/x.txt"
+  # 127.0.0.1:1 is reserved/refused → ECONNREFUSED on POST.
+  local out
+  out=$(TUSDIR="$tdir" tusc -H 127.0.0.1:1 -d -f "$root" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  [[ $rc -ne 0 ]] || { fail "dir upload to unreachable port unexpectedly succeeded; out=$out"; return 1; }
+  grep -q "Request failed" <<< "$out" \
+    || { fail "expected 'Request failed' from child; got: $out"; return 1; }
+  grep -q "Uploaded successfully" <<< "$out" \
+    && { fail "must not print 'Uploaded successfully' when child failed: $out"; return 1; }
+  return 0
+}
+
+test_creds_file_requires_both_user_and_pass() {
+  # A creds file that sets only PASS must fail loudly — historically
+  # the script accepted that and fell back to the shell's ambient
+  # $USER, silently authenticating as the local account.
+  local cf="$WORK_DIR/half-creds.sh"
+  echo 'PASS="secret"' > "$cf"
+  local out rc
+  out=$(tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$WORK_DIR/cache-cache" -c "$cf" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  [[ $rc -ne 0 ]] || { fail "expected non-zero exit for half-populated creds file; out=$out"; return 1; }
+  grep -q "must set both USER and PASS" <<< "$out" \
+    || { fail "expected complaint about missing USER; got: $out"; return 1; }
+}
+
+test_invalid_algo_rejected() {
+  # Algorithm whitelist: only sha1/sha224/sha256/sha384/sha512.
+  # `sha999` used to slip past the loose `sha*` prefix check.
+  local f="$WORK_DIR/algo.bin"
+  printf x > "$f"
+  local out rc
+  out=$(TUSDIR="$WORK_DIR/algo-cache" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha999 -S -C 2>&1) && rc=0 || rc=$?
+  [[ $rc -ne 0 ]] || { fail "sha999 should be rejected; out=$out"; return 1; }
+  grep -q "'sha999' not supported" <<< "$out" \
+    || { fail "expected explicit rejection message for sha999; got: $out"; return 1; }
+}
+
 test_dir_forwards_curl_passthrough() {
   # Curl passthrough args (everything after `--`) must reach the
   # per-file curl invocation in dir mode, not just single-file mode.
@@ -525,7 +598,11 @@ run "resume works from read-only source directory" test_resume_from_readonly_sou
 run "path with spaces survives quoting"            test_path_with_spaces
 run "identical content at different paths uploads twice" test_identical_content_different_names
 run "-N override sets Upload-Metadata.filename" test_name_override
+run "-d prints per-file success + URL; no tempfile leak"  test_dir_per_file_success_and_cleanup
+run "-d honors set -e inside the per-file subshell"       test_dir_set_e_honored_inside_subshell
 run "-d forwards -- curl passthrough args to children" test_dir_forwards_curl_passthrough
+run "--creds file with only PASS is rejected"              test_creds_file_requires_both_user_and_pass
+run "invalid --algo is rejected by whitelist"              test_invalid_algo_rejected
 run "TUSC_USER/TUSC_PASS env creds are honored" test_env_var_credentials
 run "resume announces byte offset"     test_resume_announces_offset
 run "shell-injection canary stays cold" test_shell_injection_canary
