@@ -20,7 +20,6 @@ if [[ -f $HOME/.tus.dbg ]]; then set -ex; else set -e; fi
 # historically did not support.
 FULL=$(realpath "$0")
 TUSC=$(basename "$0")
-SPINID=0
 CURLARGS=()      # passthrough curl args captured after `--`
 FILEPART_TMP=""  # per-upload tempfile, removed by on-exit even when interrupted
 MANIFEST_TMP=""  # dir-mode file list, removed by on-exit even when interrupted
@@ -50,36 +49,90 @@ fi
 # unwrapped base64 (BSD base64 has no -w, GNU wraps at 76 by default)
 b64() { base64 | tr -d '\n'; }
 
-# Hex-digest helpers. Prefer `<algo>sum` (Linux) and fall back to
-# `shasum -a <N>` (macOS, ships shasum but not sha1sum/sha256sum).
-# Both helpers capture the digest command's full output, return non-zero
-# if the command failed or produced no digest, and print the hex on
-# stdout. Don't pipe into awk inside the function: awk masks the
-# upstream command's failure under non-pipefail bash, and an unknown
-# algorithm would silently yield an empty digest.
-hash_file_hex() # $1 = algo (sha1|sha256|...), $2 = file -> "<hex>"
+# Hex digest with the named algorithm. With a file arg, hashes that
+# file; without one, reads stdin. Prefers `<algo>sum` (Linux) and
+# falls back to `shasum -a <N>` (macOS, which ships shasum but not
+# the per-algo binaries). Returns non-zero on failed command or
+# empty output — catches unknown algorithms that would otherwise
+# silently yield an empty digest under non-pipefail bash.
+hash_hex() # $1 = algo, [$2 = file] -> "<hex>"
 {
-  local out
-  if command -v "${1}sum" >/dev/null 2>&1; then
-    out=$("${1}sum" "$2") || return 1
+  local algo=$1 out
+  local -a cmd
+  if command -v "${algo}sum" >/dev/null 2>&1; then
+    cmd=("${algo}sum")
   else
-    out=$(shasum -a "${1#sha}" "$2") || return 1
+    cmd=(shasum -a "${algo#sha}")
+  fi
+  if [[ $# -ge 2 ]]; then
+    out=$("${cmd[@]}" "$2") || return 1
+  else
+    out=$("${cmd[@]}") || return 1
   fi
   out=${out%% *}
   [[ -n "$out" ]] || return 1
   printf '%s\n' "$out"
 }
-hash_stdin_hex() # $1 = algo, reads stdin -> "<hex>"
+
+# Parse a size string with optional K/M/G suffix (binary multipliers)
+# into bytes. "100" -> 100, "64K" -> 65536, "50M" -> 52428800, etc.
+parse_size() # $1 = "<num>[KMG]"
 {
-  local out
-  if command -v "${1}sum" >/dev/null 2>&1; then
-    out=$("${1}sum") || return 1
+  local v=$1 mult=1
+  case "$v" in
+    *[Kk]) mult=1024;             v=${v%[Kk]} ;;
+    *[Mm]) mult=$((1024*1024));   v=${v%[Mm]} ;;
+    *[Gg]) mult=$((1024*1024*1024)); v=${v%[Gg]} ;;
+  esac
+  case "$v" in
+    *[!0-9]*|"") return 1 ;;
+  esac
+  local result=$(( v * mult ))
+  # Sizes are positive by definition; reject 0 (and 0K/0M/0G) so it
+  # doesn't reach the chunk-count division as a divide-by-zero.
+  [[ $result -gt 0 ]] || return 1
+  echo "$result"
+}
+
+# Carve [offset, offset+len) of $in into $out. Uses dd (which seeks)
+# instead of `tail -c +N | head -c L` — BSD tail does NOT seek on
+# `+N`, it reads from byte 0, which turns the chunked PATCH loop
+# into O(N²) work for large files on macOS.
+#
+# Common fast path: offset and length are 1 MiB-aligned (true for
+# every chunk we generate from CHUNK_SIZE). When the server saved a
+# partial byte at a sub-MiB offset, fall back to a smaller block
+# size — slower but rare.
+slice_file() # $1 = in, $2 = offset, $3 = len, $4 = out
+{
+  local in=$1 off=$2 len=$3 out=$4
+  local BS=1048576   # 1 MiB
+  if (( off % BS == 0 )); then
+    # Read one extra 1 MiB block when len isn't BS-aligned, then trim
+    # with head. Avoids a `dd bs=1 skip=<huge>` read for the partial
+    # remainder — bs=1 disables the kernel's read-ahead path.
+    local total_blocks=$(( (len + BS - 1) / BS ))
+    dd if="$in" bs=$BS skip=$(( off / BS )) count=$total_blocks 2>/dev/null \
+      | head -c "$len" > "$out"
   else
-    out=$(shasum -a "${1#sha}") || return 1
+    # Unaligned start. Read in 4 KiB blocks aligned to the page, then
+    # trim the prefix. Worst case ~4 KiB of waste per chunk; the
+    # entire chunk still streams once.
+    local sub=4096
+    local skip=$(( off / sub ))
+    local pre=$(( off - skip * sub ))
+    dd if="$in" bs=$sub skip=$skip count=$(( (pre + len + sub - 1) / sub )) 2>/dev/null \
+      | tail -c +"$(( pre + 1 ))" | head -c "$len" > "$out"
   fi
-  out=${out%% *}
-  [[ -n "$out" ]] || return 1
-  printf '%s\n' "$out"
+  # `head -c` returns 0 even on short input, and tusc.sh runs without
+  # pipefail, so a short read from dd (file shrunk under us, IO error
+  # masked by 2>/dev/null) would otherwise silently produce a chunk
+  # shorter than $len — uploaded under the right Content-Length but
+  # truncated. Fail loud if the slice doesn't match.
+  local got; got=$(fsize "$out")
+  if [[ "$got" != "$len" ]]; then
+    error "slice_file: produced $got bytes, expected $len (source file may have shrunk mid-upload)" 1
+  fi
 }
 
 # Base64-of-raw-digest for the TUS Upload-Checksum header. Per
@@ -92,6 +145,19 @@ body-checksum-b64() # $1 = algo, $2 = file (the actual PATCH body)
 {
   command -v openssl >/dev/null 2>&1 || return 0
   openssl dgst "-$1" -binary "$2" 2>/dev/null | base64 | tr -d '\n'
+}
+
+# Carve a chunk of the current FILE into FILEPART_TMP (under $TUSDIR)
+# and point FILEPART at it. Drops any previous chunk tempfile so we
+# only ever hold one slice on disk at a time. The caller is then
+# free to PATCH "$FILEPART" with Content-Length = $2.
+make_chunk() # $1 = offset, $2 = length
+{
+  if [[ -n "$FILEPART_TMP" ]]; then rm -f -- "$FILEPART_TMP"; FILEPART_TMP=""; fi
+  ensure-tusdir
+  FILEPART_TMP=$(mktemp "$TUSDIR/chunk.XXXXXXXX")
+  slice_file "$FILE" "$1" "$2" "$FILEPART_TMP"
+  FILEPART=$FILEPART_TMP
 }
 
 # Resolve a TUS Location header against a base URL. Handles the four
@@ -203,6 +269,12 @@ usage()
     $(info "-C --no-color")  $(comment "Donot color the output (Useful for parsing output).")
     $(info "-f --file")      $(comment "The file to upload (or directory, with -d).")
     $(info "-R --restart")   $(comment "Ignore the cached upload URL; start a fresh upload.")
+    $(info "   --retries N") $(comment "Retry a PATCH up to N times on transient failures")
+                   $(comment "(transport error or 5xx). Default 'inf' (never give up")
+                   $(comment "on transient errors). Pass 0 to fail immediately.")
+    $(info "   --chunk-size SIZE") $(comment "Split the upload into PATCHes of SIZE bytes")
+                   $(comment "(accepts K/M/G suffix). Default 50M. Smaller chunks")
+                   $(comment "survive flaky LBs and idle-timeouts better.")
     $(info "-N --name")      $(comment "Override the filename sent in Upload-Metadata.")
                    $(comment "(May contain slashes; server gets the literal value.)")
     $(info "-d --dir")       $(comment "Treat --file as a directory; upload every file under it,")
@@ -210,7 +282,6 @@ usage()
     $(info "-h --help")      $(comment "Show help information and usage.")
     $(info "-H --host")      $(comment "The tus-server host where file is uploaded.")
     $(info "-L --locate")    $(comment "Locate the uploaded file in tus-server.")
-    $(info "-S --no-spin")   $(comment "Donot show the spinner (Useful for parsing output).")
     $(info "-u --update")    $(comment "Update tusc to latest version.")
     $(info "   --version")   $(comment "Print the current tusc version.")
 
@@ -249,7 +320,7 @@ if [[ -z "${TUSDIR:-}" ]]; then
 fi
 
 # Hash an arbitrary string to a hex digest, for use as a filename.
-strhash() { printf %s "$1" | hash_stdin_hex sha1; }
+strhash() { printf %s "$1" | hash_hex sha1; }
 
 # Cached file checksum (skip rehashing on resume). Key is opaque
 # from the helper's perspective; callers compose path+mtime+size so a
@@ -280,24 +351,20 @@ cache-loc-set() # $1 = host+basepath, $2 = key, $3 = url
   printf %s "$3" > "$TUSDIR/loc.$2.$(strhash "$1")"
 }
 
+# Per-UPLOAD_KEY "done" marker. The URL cache alone isn't enough on
+# servers that move/rename the upload after completion — the cached
+# URL then returns 404, and we can't distinguish "server forgot a
+# partial upload (retry)" from "we already finished this one
+# (skip)". The done marker records the latter.
+cache-done-mark()  { ensure-tusdir; : > "$TUSDIR/done.$1"; }
+cache-done-clear() { rm -f -- "$TUSDIR/done.$1"; }
+cache-done-check() { [[ -f "$TUSDIR/done.$1" ]]; }
+
 ensure-tusdir()
 {
   [[ -d "$TUSDIR" ]] && return 0
   mkdir -p "$TUSDIR"
   chmod 700 "$TUSDIR"
-}
-
-# Carve the tail of a file starting at byte offset $1 into a temp file
-# under $TUSDIR (a writable, per-user dir). We previously wrote
-# "$3.part" next to the source, which fails on read-only sources and
-# clobbers any existing .part file. Records the path in $FILEPART_TMP
-# so the EXIT trap can remove it even if we're interrupted.
-filepart() # $1 = start_byte, $2 = byte_length (unused; always remainder), $3 = file
-{
-  ensure-tusdir
-  FILEPART_TMP=$(mktemp "$TUSDIR/part.XXXXXXXX")
-  tail -c +"$(( $1 + 1 ))" "$3" > "$FILEPART_TMP"
-  printf '%s\n' "$FILEPART_TMP"
 }
 
 # http request
@@ -337,13 +404,11 @@ request()
   if [[ $DEBUG ]] && { [[ -z $HAS_AUTH ]] || [[ -n "${TUSC_DEBUG_UNSAFE:-}" ]]; }; then
     cmd+=(-v)
   fi
-  # -sS = silent + show errors. For the PATCH (the only large body
-  # transfer) we drop -s so curl's progress meter writes to stderr.
-  if [[ $is_patch -eq 1 && -z $NOSPIN && -z $DEBUG ]]; then
-    cmd+=(-S)
-  else
-    cmd+=(-sS)
-  fi
+  # -sS = silent + show errors. We don't expose curl's progress meter
+  # — the per-chunk timing line and our own "↗ chunk N/M" markers do
+  # the equivalent more compactly. Pass curl flags via `--` if you
+  # want curl's own meter (e.g. `-- --progress-bar`).
+  cmd+=(-sS)
   cmd+=(-L -D "$HEADER" -H "Tus-Resumable: 1.0.0")
   [[ $HAS_AUTH ]] && cmd+=(--basic --user "$CRED_USER:$CRED_PASS")
   # CURLARGS is a user-supplied passthrough captured as an array from
@@ -378,17 +443,21 @@ request()
 
   # For PATCH and DEBUG, let stderr flow to the terminal (progress meter
   # / -v transcript). Otherwise fold stderr into the captured body so
-  # curl's transport errors land in the request-failed message. Suspend
-  # `set -e` around the substitution so a curl transport failure (curl
-  # exits non-zero, e.g. ECONNREFUSED) doesn't abort the script before
-  # we get to inspect $STATUS and emit a useful error.
-  set +e
+  # curl's transport errors land in the request-failed message.
+  #
+  # Capture curl's exit code into a sibling file because `|| true`
+  # swallows it and bash 3.2 + set -e doesn't tolerate a non-zero
+  # status on the substitution itself. CURL_RC then drives the
+  # transient-failure detection in the retry loop (a "100 Continue"
+  # followed by a TCP RST leaves STATUS=100 but CURL_RC≠0).
+  local rcfile; rcfile=$(mktemp -t tusc-rc.XXXXXXXX)
   if [[ $DEBUG || $is_patch -eq 1 ]]; then
-    BODY=$("${cmd[@]}")
+    BODY=$( { "${cmd[@]}"; printf %d $? > "$rcfile"; } || true )
   else
-    BODY=$("${cmd[@]}" 2>&1)
+    BODY=$( { "${cmd[@]}" 2>&1; printf %d $? > "$rcfile"; } || true )
   fi
-  set -e
+  CURL_RC=$(cat "$rcfile" 2>/dev/null || echo 0)
+  rm -f -- "$rcfile"
 
   # Pull %{url_effective} (and its markers) back out of BODY.
   EFFECTIVE_URL=""
@@ -410,14 +479,17 @@ request()
     suppress=1
   fi
 
+  LAST_ERROR_MSG=""
   if [[ $ISOK -eq 0 && $suppress -eq 0 ]]; then
     # Prefer curl's post-redirect URL; fall back to the caller's last
     # positional arg (the URL by convention). Don't use cmd[-1] —
     # that's our internal `-w` value now that it appends last.
     local target="${EFFECTIVE_URL:-$target_url}"
-    local msg="✖ Request failed: HTTP ${STATUS:-?} on $target"
-    [[ -n "$BODY" ]] && msg="$msg"$'\n'"$BODY"
-    error "$msg" 1
+    LAST_ERROR_MSG="✖ Request failed: HTTP ${STATUS:-?} on $target"
+    if [[ -n "$BODY" ]]; then LAST_ERROR_MSG="$LAST_ERROR_MSG"$'\n'"$BODY"; fi
+    # REQUEST_TRY=1 lets a caller (the retry loop) handle the failure
+    # itself instead of exiting outright.
+    if [[ -z "${REQUEST_TRY:-}" ]]; then error "$LAST_ERROR_MSG" 1; fi
   fi
   return $RET
 }
@@ -446,46 +518,16 @@ header() # $1 = key
   ' "$HEADER"
 }
 
-# show spinner and mark its pid
-spinner()
-{
-  [[ $NOSPIN ]] && return 0
-  do-spin &
-  SPINID=$!
-  disown
-}
-
-# do spin (credits: https://www.shellscript.sh/tips/spinner/)
-do-spin()
-{
-  local chars="+/|\\-+/|\\-"
-  while :; do
-    for i in `seq 0 9`; do
-      echo -n "${chars:$i:1}" && echo -en "\010" && sleep 0.1
-    done
-  done
-}
-
-no-spinner()
-{
-  [[ $NOSPIN ]] && return 0
-  local PID=$SPINID
-  SPINID=0
-  if [[ $PID -ne 0 ]]; then
-    kill $PID 2> /dev/null
-    wait $PID 2> /dev/null
-  fi
-  # Overwrite whatever glyph the spinner left at the cursor with a
-  # space, then return to col 0. Works without ANSI support.
-  printf '\r  \r' >&2
-}
-
 # Print the success line + URL inline. Sets REPORTED=1 so on-exit
-# doesn't add an "Unfinished upload" hint on top. (See the dir-mode
-# block below for why this is inline and not in the EXIT trap.)
+# doesn't add an "Unfinished upload" hint on top. Also marks the
+# upload as done so a future re-run can short-circuit before the
+# HEAD probe — important for servers that move/rename the upload
+# after completion (the cached URL would 404, look like a lost
+# partial, and trip a fresh re-upload otherwise).
 report_success()
 {
   REPORTED=1
+  cache-done-mark "$UPLOAD_KEY"
   if [[ $SKIPPED ]]; then
     ok "ℹ Already uploaded — skipping (re-run with --restart to overwrite)."
   else
@@ -498,7 +540,6 @@ report_success()
 # resume" hint if upload_one didn't get to report_success first.
 on-exit()
 {
-  no-spinner
   rm -f -- "$FILEPART_TMP" "$MANIFEST_TMP" "$HEADER0" "$HEADER" 2>/dev/null
   [[ $REPORTED ]] && return 0
   [[ -z "${OFFSET:-}" ]] && return 0
@@ -524,10 +565,11 @@ while [[ $# -gt 0 ]]; do
     -h | --help | help) usage $1; exit 0 ;;
     -H | --host) HOST="$2"; shift 2 ;;
     -L | --locate) LOCATE=1; shift ;;
-    -S | --no-spin) NOSPIN=1; shift ;;
     -R | --restart) RESTART=1; shift ;;
     -d | --dir) DIRMODE=1; shift ;;
     -N | --name) NAME_OVERRIDE="$2"; shift 2 ;;
+    --retries) RETRIES="$2"; shift 2 ;;
+    --chunk-size) CHUNK_SIZE_RAW="$2"; shift 2 ;;
     -u | --update) update; exit 0 ;;
          --version | version) version; exit 0 ;;
     --) shift; CURLARGS=("$@"); break ;;
@@ -604,9 +646,10 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
   fi
   if [[ -z "$KEY" ]]; then
     [[ $DEBUG ]] && debug "> checksum $SUMALGO $FILE"
-    spinner
-    KEY=$(hash_file_hex "$SUMALGO" "$FILE")
-    no-spinner
+    # Progress line on stderr — stdout is reserved for "URL: ..." so
+    # callers can capture it via $(tusc.sh -L ...).
+    line "Hashing file ($SUMALGO)..." 33 0 "" 2
+    KEY=$(hash_hex "$SUMALGO" "$FILE")
     cache-checksum-set "$CKEY" "$SUMALGO" "$KEY"
   fi
 
@@ -615,27 +658,42 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
   # backend (rare but real) don't collide on servers that dedupe
   # globally by Upload-Key. Re-running the same upload at the same
   # full destination still keys identically, so resume works.
-  UPLOAD_KEY=$(printf '%s:%s:%s:%s' "$KEY" "$HOST" "$BASEPATH" "$NAME" | hash_stdin_hex "$SUMALGO")
+  UPLOAD_KEY=$(printf '%s:%s:%s:%s' "$KEY" "$HOST" "$BASEPATH" "$NAME" | hash_hex "$SUMALGO")
 
   [[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nUPLOAD_KEY: $UPLOAD_KEY"
 
   TUSURL=$(cache-loc-get "$HOST$BASEPATH" "$UPLOAD_KEY")
 
-  # --restart needs to (a) ignore the cached URL and (b) send a fresh
-  # Upload-Key so a server that dedupes on it creates a new upload
-  # instead of handing back the existing one. POST_UPLOAD_KEY carries
-  # an extra nonce on restart; the local cache (and resume on later
-  # non-restart runs) still keys on the canonical UPLOAD_KEY.
+  # --restart needs to (a) clear the done marker, (b) ignore the
+  # cached URL, and (c) send a fresh Upload-Key so a server that
+  # dedupes on it creates a new upload instead of handing back the
+  # existing one. POST_UPLOAD_KEY carries an extra nonce on restart;
+  # the local cache (and resume on later non-restart runs) still
+  # keys on the canonical UPLOAD_KEY.
   POST_UPLOAD_KEY=$UPLOAD_KEY
   if [[ $RESTART ]]; then
+    cache-done-clear "$UPLOAD_KEY"
     TUSURL=""
-    POST_UPLOAD_KEY="$UPLOAD_KEY-$(printf '%s%s%s' "$$" "$RANDOM" "$(date +%s%N 2>/dev/null || date +%s)" | hash_stdin_hex sha1 | cut -c1-16)"
+    POST_UPLOAD_KEY="$UPLOAD_KEY-$(printf '%s%s%s' "$$" "$RANDOM" "$(date +%s%N 2>/dev/null || date +%s)" | hash_hex sha1 | cut -c1-16)"
   fi
 
+  # --locate prints the cached URL (or exits non-zero if we have no
+  # entry) and stops. Run BEFORE the done-marker short-circuit, which
+  # would otherwise return the "Already uploaded" success path with
+  # no URL on stdout.
   if [[ $LOCATE ]]; then
     info "URL: $TUSURL"
     REPORTED=1
     [[ -n "$TUSURL" ]] && exit 0 || exit 1
+  fi
+
+  # Already uploaded once at this exact destination? Short-circuit
+  # before the HEAD probe; the HEAD would 404 on servers that move
+  # the upload after completion and trip a redundant re-upload.
+  if cache-done-check "$UPLOAD_KEY"; then
+    SKIPPED=1
+    report_success
+    exit 0
   fi
 
   # Probe the cached URL. A 404/410 just means the server forgot it —
@@ -654,8 +712,9 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
     if [[ $OFFSET -gt 0 ]]; then
       PCT=$(( OFFSET * 100 / SIZE ))
       info "↻ Resuming at byte $OFFSET / $SIZE (${PCT}%)"
-      [[ $DEBUG ]] && debug "> filepart $OFFSET $LEFTOVER $FILE"
-      spinner && FILEPART=$(filepart "$OFFSET" "$LEFTOVER" "$FILE") && no-spinner
+      # The chunked PATCH loop below carves each chunk on demand via
+      # slice_file. No need (and a bad idea for big resumes) to pre-
+      # carve the entire remaining tail up front.
     fi
   else
     OFFSET=0 LEFTOVER=$SIZE
@@ -685,45 +744,143 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
     fi
   fi
 
-  # PATCH. `--upload-file` already sets Content-Length; an explicit
-  # `Transfer-Encoding: chunked` here is invalid in HTTP/2 (curl emits
-  # chunk-framed bytes inside the H2 body, tripping LB 400s).
-  #
-  # Per the TUS spec Upload-Checksum is for the *current request
-  # body*, so we digest FILEPART (the partial slice on resume), not
-  # the whole file. Skip if openssl isn't available.
-  PATCH_ARGS=(
-    -H "Content-Type: application/offset+octet-stream"
-    -H "Content-Length: $LEFTOVER"
-    -H "Upload-Offset: $OFFSET"
-  )
-  PATCH_SUM=$(body-checksum-b64 "$SUMALGO" "$FILEPART")
-  [[ -n "$PATCH_SUM" ]] && PATCH_ARGS+=(-H "Upload-Checksum: $SUMALGO $PATCH_SUM")
-  PATCH_ARGS+=(--upload-file "$FILEPART" --request PATCH "$TUSURL")
-  request "${PATCH_ARGS[@]}" || error "Request failed" 1
+  # Chunked PATCH. Carve the file into chunks of $CHUNK_SIZE bytes and
+  # PATCH each one. Smaller chunks (a) survive LB idle-timeouts and
+  # mid-stream RSTs without losing the whole upload, and (b) give the
+  # retry loop a much smaller unit to redo. Each chunk carries its
+  # own Upload-Checksum (per the TUS spec — checksum is over the
+  # current request body, not the file).
+  local CHUNK_SIZE
+  CHUNK_SIZE=$(parse_size "${CHUNK_SIZE_RAW:-50M}") \
+    || error "--chunk-size: bad size '$CHUNK_SIZE_RAW'" 1
+  # Retry policy. Default 'inf' — chunking + retry is the design's
+  # whole point for surviving flaky LBs, so "never give up on a
+  # transient failure" is the safer default. 4xx still fails
+  # immediately; pass --retries 0 for strict-fail or --retries N
+  # to cap. Anything else (e.g. "--retries 3x") errors out — like
+  # --chunk-size, bad input is rejected loudly rather than silently
+  # falling back to 0.
+  local PATCH_MAX
+  case "${RETRIES:-inf}" in
+    inf|infinite) PATCH_MAX="" ;;
+    ""|*[!0-9]*)  error "--retries: bad value '${RETRIES}' (use a non-negative integer or 'inf')" 1 ;;
+    *)            PATCH_MAX=$((1 + RETRIES)) ;;
+  esac
 
-  # tusd returns the final Upload-Offset in the PATCH 204 response.
-  PATCH_OFFSET=$(header "Upload-Offset")
-  if [[ "$PATCH_OFFSET" == "$SIZE" ]]; then
-    OFFSET=$PATCH_OFFSET
-    report_success
-    exit 0
-  fi
+  local total_chunks chunk_idx=0 chunk_len remaining backoff
+  total_chunks=$(( (SIZE - OFFSET + CHUNK_SIZE - 1) / CHUNK_SIZE ))
 
-  # Fallback: poll HEAD up to 30 iterations for servers that respond
-  # before committing.
-  HEADER0=$HEADER; HEADER=$(mktemp -t tus.XXXXXXXXXX)
-  for _ in $(seq 1 30); do
-    request --head "$TUSURL" > /dev/null || true
-    POLL_OFFSET=$(header "Upload-Offset")
-    if [[ "$POLL_OFFSET" == "$SIZE" ]]; then
-      OFFSET=$POLL_OFFSET
-      report_success
-      exit 0
+  while [[ $OFFSET -lt $SIZE ]]; do
+    chunk_idx=$((chunk_idx+1))
+    remaining=$((SIZE - OFFSET))
+    chunk_len=$CHUNK_SIZE
+    if [[ $chunk_len -gt $remaining ]]; then chunk_len=$remaining; fi
+
+    if [[ $total_chunks -gt 1 ]]; then
+      info "↗ chunk $chunk_idx/$total_chunks (offset $OFFSET, $chunk_len bytes)"
     fi
-    sleep 2
+
+    # Carve this chunk out of $FILE into FILEPART_TMP under $TUSDIR.
+    # Time each step so the user can see whether the wall-clock cost
+    # is the slice, the per-chunk checksum, or the actual PATCH upload.
+    # All three are CUMULATIVE across retry attempts for the chunk: a
+    # transient PATCH that triggers a re-slice + re-checksum + re-PATCH
+    # gets all three of those costs added back in, so the printed
+    # totals reflect everything spent on the chunk.
+    local t_slice=0 t_sum=0 t_patch=0 t0
+    t0=$SECONDS
+    make_chunk "$OFFSET" "$chunk_len"
+    t_slice=$((t_slice + SECONDS - t0))
+
+    # Per-chunk retry loop.
+    local PATCH_ATTEMPT=0 PATCH_RC
+    while :; do
+      PATCH_ATTEMPT=$((PATCH_ATTEMPT+1))
+      local PATCH_ARGS=(
+        -H "Content-Type: application/offset+octet-stream"
+        -H "Content-Length: $chunk_len"
+        -H "Upload-Offset: $OFFSET"
+      )
+      local PATCH_SUM
+      t0=$SECONDS
+      PATCH_SUM=$(body-checksum-b64 "$SUMALGO" "$FILEPART")
+      t_sum=$((t_sum + SECONDS - t0))
+      if [[ -n "$PATCH_SUM" ]]; then PATCH_ARGS+=(-H "Upload-Checksum: $SUMALGO $PATCH_SUM"); fi
+      PATCH_ARGS+=(--upload-file "$FILEPART" --request PATCH "$TUSURL")
+
+      PATCH_RC=0
+      t0=$SECONDS
+      REQUEST_TRY=1 request "${PATCH_ARGS[@]}" || PATCH_RC=$?
+      unset REQUEST_TRY
+      t_patch=$((t_patch + SECONDS - t0))
+      if [[ $PATCH_RC -eq 0 ]]; then
+        if [[ $total_chunks -gt 1 ]]; then
+          info "  slice=${t_slice}s checksum=${t_sum}s PATCH=${t_patch}s"
+        fi
+        break
+      fi
+
+      # Transient classification:
+      #   curl signalled a known transport-level failure (whitelist of
+      #   exit codes), OR curl completed cleanly with a retryable
+      #   HTTP status (5xx, 408, 429). Anything else — including
+      #   curl exiting with a "URL is malformed" type code (3, 6, ...)
+      #   or the server returning 4xx — is permanent and we error
+      #   immediately instead of looping forever.
+      local transient=0
+      case "${CURL_RC:-0}" in
+        # 7 connect refused, 18 partial transfer, 28 timeout,
+        # 35 TLS handshake, 52 empty reply, 55 send fail (broken pipe),
+        # 56 recv fail (RST), 92 stream error (HTTP/2)
+        7|18|28|35|52|55|56|92) transient=1 ;;
+        0)
+          case "$STATUS" in
+            5*|408|429) transient=1 ;;
+          esac
+          ;;
+      esac
+      if [[ $transient -eq 0 ]]; then error "$LAST_ERROR_MSG" 1; fi
+      if [[ -n "$PATCH_MAX" && $PATCH_ATTEMPT -ge $PATCH_MAX ]]; then
+        error "$LAST_ERROR_MSG" 1
+      fi
+
+      backoff=$(( PATCH_ATTEMPT * 2 ))
+      if [[ $backoff -gt 30 ]]; then backoff=30; fi
+      info "↻ chunk $chunk_idx PATCH failed (transient), retry $PATCH_ATTEMPT/${RETRIES:-inf} after ${backoff}s"
+      sleep "$backoff"
+
+      # Re-HEAD to learn the server-saved offset; the chunk may have
+      # partly persisted, so we re-carve from the new offset.
+      REQUEST_TRY=1 request --head "$TUSURL" > /dev/null || true
+      unset REQUEST_TRY
+      local NEW_OFFSET; NEW_OFFSET=$(header "Upload-Offset")
+      if [[ -n "$NEW_OFFSET" && "$NEW_OFFSET" != "$OFFSET" ]]; then
+        OFFSET=$NEW_OFFSET
+        remaining=$((SIZE - OFFSET))
+        if [[ $remaining -le 0 ]]; then
+          report_success
+          exit 0
+        fi
+        chunk_len=$CHUNK_SIZE
+        if [[ $chunk_len -gt $remaining ]]; then chunk_len=$remaining; fi
+        t0=$SECONDS
+        make_chunk "$OFFSET" "$chunk_len"
+        t_slice=$((t_slice + SECONDS - t0))
+      fi
+    done
+
+    # Successful PATCH for this chunk. Use the server's reported
+    # Upload-Offset if present; otherwise estimate via chunk_len.
+    local PATCH_OFFSET; PATCH_OFFSET=$(header "Upload-Offset")
+    if [[ -n "$PATCH_OFFSET" ]]; then
+      OFFSET=$PATCH_OFFSET
+    else
+      OFFSET=$((OFFSET + chunk_len))
+    fi
   done
-  error "Upload did not finalize after polling" 1
+
+  report_success
+  exit 0
 }
 
 trap on-exit EXIT

@@ -38,12 +38,20 @@ TUSD_DIR="$CACHE_DIR/tusd_${TUSD_OS}_${TUSD_ARCH}_${TUSD_VERSION}"
 TUSD_BIN="$TUSD_DIR/tusd"
 
 TUSD_PID=""
-STUB_PID=""
+# Pidfile path — single file, lives in $WORK_DIR. Callers use
+# `port=$(start_python_stub ...)` which runs the helper in a subshell;
+# a STUB_PID variable assigned there would be lost to the parent. The
+# pidfile crosses the subshell boundary cleanly.
+STUB_PIDFILE="$WORK_DIR/stub.pid"
 cleanup() {
-  local rc=$?
-  for pid in "$TUSD_PID" "$STUB_PID"; do
-    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null || true
-  done
+  local rc=$? pid
+  if [[ -n "$TUSD_PID" ]]; then
+    kill -0 "$TUSD_PID" 2>/dev/null && kill "$TUSD_PID" 2>/dev/null && wait "$TUSD_PID" 2>/dev/null || true
+  fi
+  if [[ -f "$STUB_PIDFILE" ]]; then
+    pid=$(cat "$STUB_PIDFILE" 2>/dev/null) || pid=""
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
+  fi
   if [[ $rc -ne 0 && -f "$WORK_DIR/tusd.log" ]]; then
     echo "----- tusd.log -----" >&2
     cat "$WORK_DIR/tusd.log" >&2
@@ -122,6 +130,101 @@ tusc() { ( cd "$REPO_ROOT" && bash ./tusc.sh "$@" ); }
 # Extract the URL line out of tusc.sh output.
 extract_url() { awk '/^[[:space:]]*URL:[[:space:]]/ { sub(/^[[:space:]]*URL:[[:space:]]+/, ""); print; exit }'; }
 
+# Launch a Python HTTP stub on a random port. The argument is the
+# Python *body* of the handler (typically a class H definition);
+# we wrap it with the boilerplate that picks up $PORT and serves
+# until killed. Writes the PID to $STUB_PIDFILE (works across the
+# command-substitution subshell that callers use), prints the port
+# on stdout. Waits for the port to accept connections.
+#
+# Return codes:
+#   0 — stub started, port is on stdout
+#   1 — python3 not available (caller should "skip")
+#   2 — python3 present, but the stub never accepted a connection
+#       (caller should FAIL — this is a test-infra bug, not a skip).
+#       A diagnostic is written to stderr before returning.
+#
+# Caller pattern (replaces the broken "skip on any failure"):
+#   port=$(require_python_stub '...') || {
+#     local rc=$?
+#     [[ $rc -eq 1 ]] && { say "    skip: python3 not available"; return 0; }
+#     return 1
+#   }
+start_python_stub() # $1 = python body
+{
+  command -v python3 >/dev/null 2>&1 || return 1
+  # If a previous test left a stub running (e.g. it failed before
+  # calling stop_python_stub), reap it so we don't leak Python
+  # processes for the lifetime of the test suite.
+  if [[ -f "$STUB_PIDFILE" ]]; then
+    local prev; prev=$(cat "$STUB_PIDFILE" 2>/dev/null) || prev=""
+    [[ -n "$prev" ]] && kill "$prev" 2>/dev/null && wait "$prev" 2>/dev/null || true
+    rm -f "$STUB_PIDFILE"
+  fi
+  local port=$((40000 + RANDOM % 10000))
+  local stub="$WORK_DIR/stub-$port.py"
+  {
+    printf 'import http.server, socketserver, sys, threading\n'
+    printf 'PORT = int(sys.argv[1])\n'
+    printf '%s\n' "$1"
+    printf 'socketserver.TCPServer.allow_reuse_address = True\n'
+    printf 'with socketserver.TCPServer(("127.0.0.1", PORT), H) as s: s.serve_forever()\n'
+  } > "$stub"
+  python3 "$stub" "$port" >/dev/null 2>&1 &
+  local pid=$!
+  printf '%s\n' "$pid" > "$STUB_PIDFILE"
+  local _ ready=0
+  for _ in $(seq 1 50); do
+    if curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; then ready=1; break; fi
+    sleep 0.05
+  done
+  if [[ $ready -eq 0 ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$STUB_PIDFILE"
+    printf '    FAIL: python stub on port %d never accepted a connection\n' "$port" >&2
+    return 2
+  fi
+  printf '%s\n' "$port"
+}
+
+# Thin wrapper around start_python_stub: handles the "python3 missing
+# vs stub broke" decision so callers don't repeat the rc-branching.
+# Returns:
+#   0 — stub ready, port on stdout
+#   2 — python3 missing (skip message printed; caller should `return 0`)
+#   1 — stub failed to launch (FAIL diagnostic was on stderr from
+#       start_python_stub; caller should `return 1`)
+#
+# Caller idiom — one short line that maps both failures correctly:
+#   port=$(require_python_stub '...') || return $((2 - $?))
+# (rc=1 -> caller returns 1 (FAIL); rc=2 -> caller returns 0 (skip-PASS))
+require_python_stub() # $1 = python body
+{
+  local port rc
+  port=$(start_python_stub "$1") && { printf '%s\n' "$port"; return 0; }
+  rc=$?
+  if [[ $rc -eq 1 ]]; then
+    say "    skip: python3 not available"
+    return 2
+  fi
+  return 1
+}
+
+# Stop the running Python stub via the pidfile (which crosses the
+# command-substitution subshell boundary the helper runs in). Safe
+# to call when no stub is running.
+stop_python_stub()
+{
+  [[ -f "$STUB_PIDFILE" ]] || return 0
+  local pid; pid=$(cat "$STUB_PIDFILE" 2>/dev/null) || pid=""
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -f "$STUB_PIDFILE"
+}
+
 # ---- test framework --------------------------------------------------
 
 PASS=0; FAILS=0; FAILED=()
@@ -147,8 +250,8 @@ roundtrip_helper() { # $1 = label, $2 = fixture
   local sum_src sum_dst url downloaded
   sum_src="$(sha256 "$fixture")"
 
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$fixture" -a sha256 -S -C >/dev/null
-  url="$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$fixture" -a sha256 -L -S -C | extract_url)"
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$fixture" -a sha256 -C >/dev/null
+  url="$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$fixture" -a sha256 -L -C | extract_url)"
   [[ -n "$url" && "$url" != "null" ]] || fail "could not locate uploaded URL"
 
   downloaded="$WORK_DIR/$label.downloaded"
@@ -180,9 +283,9 @@ test_text_roundtrip() {
 test_cache_hit_message() {
   local f="$WORK_DIR/cache.bin"; local tdir="$WORK_DIR/cache-cache"
   dd if=/dev/urandom of="$f" bs=1024 count=64 2>/dev/null
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C >/dev/null
   local out
-  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C)
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C)
   grep -q "Already uploaded" <<< "$out" || fail "expected 'Already uploaded' on cache hit; got: $out"
 }
 
@@ -190,24 +293,35 @@ test_restart_replaces_upload() {
   local f="$WORK_DIR/restart.bin"; local tdir="$WORK_DIR/restart-cache"
   dd if=/dev/urandom of="$f" bs=1024 count=64 2>/dev/null
   local u1 u2
-  u1=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C | extract_url)
-  u2=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C --restart | extract_url)
+  u1=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C | extract_url)
+  u2=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C --restart | extract_url)
   [[ -n "$u1" && -n "$u2" ]] || fail "missing URL on one of the runs: u1=$u1 u2=$u2"
   [[ "$u1" != "$u2" ]] || fail "--restart did not create a fresh upload (same URL: $u1)"
 }
 
-test_stale_cache_url_recovers() {
-  # Cache has a URL the server has since forgotten (404 on HEAD).
-  # Should fall through to a fresh POST without surfacing an error.
+test_done_marker_trusts_local_state_over_server_404() {
+  # Once we've successfully uploaded a file, the local "done" marker
+  # is authoritative: a later run reports "Already uploaded" without
+  # HEAD'ing the cached URL — many TUS servers move/rename the upload
+  # after completion, so that URL would 404 and the script can't
+  # distinguish "server moved it" from "server lost it". --restart is
+  # the explicit override for "I know the server actually lost it".
   local f="$WORK_DIR/stale.bin"; local tdir="$WORK_DIR/stale-cache"
   dd if=/dev/urandom of="$f" bs=1024 count=64 2>/dev/null
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null
-  # Wipe tusd's upload dir to simulate server-side cleanup.
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C >/dev/null
+  # Wipe tusd's upload dir to simulate a server that purged or moved
+  # the upload after the fact.
   rm -rf "$UPLOAD_DIR"; mkdir -p "$UPLOAD_DIR"
+
   local out
-  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C)
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C)
+  grep -q "Already uploaded" <<< "$out" \
+    || { fail "expected 'Already uploaded' from done-marker; got: $out"; return 1; }
+
+  # --restart bypasses the marker and actually re-uploads.
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C --restart)
   grep -q "Uploaded successfully" <<< "$out" \
-    || fail "expected fresh upload after stale-cache 404; got: $out"
+    || { fail "expected fresh upload under --restart; got: $out"; return 1; }
 }
 
 test_dir_upload_preserves_paths() {
@@ -220,7 +334,7 @@ test_dir_upload_preserves_paths() {
   echo bbb > "$root/a/b/nested.txt"
   echo ccc > "$root/c/cc.bin"
 
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -S -C >/dev/null \
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -C >/dev/null \
     || fail "tusc -d failed"
 
   # tusd v2 stores Upload-Metadata in <uploadid>.info next to the file.
@@ -249,11 +363,11 @@ test_zero_byte_file() {
   local f="$WORK_DIR/empty.bin"; local tdir="$WORK_DIR/empty-cache"
   : > "$f"
   local out
-  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C) || {
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C) || {
     fail "0-byte upload exited non-zero"; return 1; }
   grep -q "Uploaded successfully" <<< "$out" || {
     fail "0-byte upload didn't print success: $out"; return 1; }
-  local url; url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -S -C | extract_url)
+  local url; url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -C | extract_url)
   [[ -n "$url" ]] || { fail "could not locate 0-byte upload"; return 1; }
   curl -fsSL "$url" -o "$WORK_DIR/empty.dl"
   local dl_size; dl_size=$(wc -c < "$WORK_DIR/empty.dl" | tr -d ' ')
@@ -292,7 +406,7 @@ test_resume_from_readonly_source_dir() {
   seed_loc_cache "$tdir" "$rodir/big.bin" "$TUSD_HOST:$TUSD_PORT" "/files/" "big.bin" "$loc"
 
   local out rc
-  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$rodir/big.bin" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$rodir/big.bin" -a sha256 -C 2>&1) && rc=0 || rc=$?
   chmod 755 "$rodir"   # restore for cleanup
   [[ $rc -eq 0 ]] || { fail "expected resume to succeed on read-only source dir; rc=$rc out=$out"; return 1; }
   grep -q "↻ Resuming at byte 262144" <<< "$out" \
@@ -306,10 +420,10 @@ test_path_with_spaces() {
   # cleanup trap, metadata building, and curl invocation.
   local f="$WORK_DIR/has space.bin"; local tdir="$WORK_DIR/space-cache"
   dd if=/dev/urandom of="$f" bs=1024 count=32 2>/dev/null
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null \
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C >/dev/null \
     || fail "upload failed for path with spaces"
   local url
-  url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -S -C | extract_url)
+  url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -C | extract_url)
   [[ -n "$url" ]] || fail "could not locate upload of spaced-path file"
   local got="$WORK_DIR/got.bin"
   curl -fsSL "$url" -o "$got"
@@ -325,7 +439,7 @@ test_identical_content_different_names() {
   printf 'identical 39 bytes of fixture content..' > "$root/a/same.txt"
   printf 'identical 39 bytes of fixture content..' > "$root/b/same.txt"
 
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -S -C >/dev/null \
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -C >/dev/null \
     || fail "tusc -d failed on duplicate-content batch"
 
   # Both relpaths must be present in the upload-dir's .info files —
@@ -343,12 +457,48 @@ test_identical_content_different_names() {
 test_name_override() {
   local f="$WORK_DIR/named.bin"; local tdir="$WORK_DIR/name-cache"
   dd if=/dev/urandom of="$f" bs=1024 count=16 2>/dev/null
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -N "deep/path/renamed.bin" -a sha256 -S -C >/dev/null
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -N "deep/path/renamed.bin" -a sha256 -C >/dev/null
   local found=0
   for info in "$UPLOAD_DIR"/*.info; do
     grep -q '"filename":"deep/path/renamed.bin"' "$info" && { found=1; break; }
   done
   [[ $found -eq 1 ]] || fail "Upload-Metadata.filename did not honor --name override"
+}
+
+test_dir_rerun_skips_completed_files() {
+  # The user-reported scenario: re-running `--dir` against the same
+  # source must short-circuit already-uploaded files via the done
+  # marker. Without it, servers that move/rename completed uploads
+  # would 404 every cached URL and the script would re-upload the
+  # whole tree from scratch.
+  local root="$WORK_DIR/rerun"; local tdir="$WORK_DIR/rerun-cache"
+  mkdir -p "$root"
+  printf 'a' > "$root/a.txt"
+  printf 'b' > "$root/b.txt"
+
+  # Run 1: fresh batch.
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -C >/dev/null \
+    || { fail "first dir upload failed"; return 1; }
+
+  # Simulate the server moving the uploads away (purge upload-dir).
+  rm -rf "$UPLOAD_DIR"; mkdir -p "$UPLOAD_DIR"
+
+  # Run 2: every file should short-circuit with "Already uploaded";
+  # no PATCH should hit the server.
+  local out
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -C)
+  local already
+  already=$(grep -c "Already uploaded" <<< "$out")
+  [[ "$already" == 2 ]] \
+    || { fail "expected 2 'Already uploaded' lines on re-run; got $already in: $out"; return 1; }
+  local fresh
+  fresh=$(grep -c "✔ Uploaded successfully" <<< "$out")
+  [[ "$fresh" == 0 ]] \
+    || { fail "re-run uploaded $fresh file(s) again; expected 0. out: $out"; return 1; }
+  # And tusd's upload-dir is still empty — no PATCHes landed.
+  local landed; landed=$(find "$UPLOAD_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+  [[ "$landed" == 0 ]] \
+    || { fail "expected no server-side uploads on re-run; saw $landed file(s)"; return 1; }
 }
 
 test_dir_per_file_success_and_cleanup() {
@@ -360,7 +510,7 @@ test_dir_per_file_success_and_cleanup() {
   echo aaa > "$root/x.txt"
   echo bbb > "$root/a/y.txt"
   local out
-  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -S -C) \
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -C) \
     || { fail "dir upload failed: $out"; return 1; }
   local upcount
   upcount=$(grep -c "Uploaded successfully" <<< "$out")
@@ -386,7 +536,7 @@ test_dir_set_e_honored_inside_subshell() {
   echo aaa > "$root/x.txt"
   # 127.0.0.1:1 is reserved/refused → ECONNREFUSED on POST.
   local out
-  out=$(TUSDIR="$tdir" tusc -H 127.0.0.1:1 -d -f "$root" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  out=$(TUSDIR="$tdir" tusc -H 127.0.0.1:1 -d -f "$root" -a sha256 -C 2>&1) && rc=0 || rc=$?
   [[ $rc -ne 0 ]] || { fail "dir upload to unreachable port unexpectedly succeeded; out=$out"; return 1; }
   grep -q "Request failed" <<< "$out" \
     || { fail "expected 'Request failed' from child; got: $out"; return 1; }
@@ -401,7 +551,7 @@ test_creds_file_requires_both_user_and_pass() {
   local cf="$WORK_DIR/half-creds.sh"
   echo 'PASS="secret"' > "$cf"
   local out rc
-  out=$(tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$WORK_DIR/cache-cache" -c "$cf" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  out=$(tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$WORK_DIR/cache-cache" -c "$cf" -a sha256 -C 2>&1) && rc=0 || rc=$?
   [[ $rc -ne 0 ]] || { fail "expected non-zero exit for half-populated creds file; out=$out"; return 1; }
   grep -q "must set both USER and PASS" <<< "$out" \
     || { fail "expected complaint about missing USER; got: $out"; return 1; }
@@ -414,7 +564,7 @@ test_checksum_cache_invalidates_on_size_change() {
   mkdir -p "$tdir"
   printf 'AAAA' > "$f"
   local mt; mt=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C >/dev/null
   # Rewrite with different content + size; restore the original mtime
   # (some editors do this; `cp -p`, `tar -p`, `touch -r` all preserve).
   printf 'BBBBBBBB' > "$f"
@@ -428,12 +578,12 @@ test_checksum_cache_invalidates_on_size_change() {
   # wrong UPLOAD_KEY -> wrong server-side identity). With the fix, the
   # size change invalidates the entry and a fresh checksum is taken.
   local out
-  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C 2>&1) \
     || { fail "second upload failed: $out"; return 1; }
   grep -q "Uploaded successfully" <<< "$out" \
     || { fail "expected a fresh successful upload after content change; got: $out"; return 1; }
   # And the new upload must reflect the new size on the server.
-  local url; url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -S -C | extract_url)
+  local url; url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -C | extract_url)
   [[ -n "$url" ]] || { fail "could not locate the second upload"; return 1; }
   curl -fsSL "$url" -o "$WORK_DIR/cache-size.dl"
   cmp -s "$f" "$WORK_DIR/cache-size.dl" \
@@ -449,15 +599,15 @@ test_checksum_cache_invalidates_on_subsecond_rewrite() {
   mkdir -p "$tdir"
   # Same 16-byte size, different content.
   printf 'AAAAAAAAAAAAAAAA' > "$f"
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C >/dev/null
   # Rewrite immediately; on a fast filesystem this lands in the same
   # wall-second. Even if it doesn't, nanoseconds will differ.
   printf 'BBBBBBBBBBBBBBBB' > "$f"
   local out
-  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C 2>&1) \
     || { fail "second upload failed: $out"; return 1; }
   local url
-  url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -S -C | extract_url)
+  url=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -L -a sha256 -C | extract_url)
   curl -fsSL "$url" -o "$WORK_DIR/subsec.dl"
   cmp -s "$f" "$WORK_DIR/subsec.dl" \
     || { fail "downloaded bytes didn't match the new content (stale-cache hit)"; return 1; }
@@ -467,11 +617,11 @@ test_tusc_nocache_forces_rehash() {
   # TUSC_NOCACHE=1 must bypass the checksum cache regardless of cache state.
   local f="$WORK_DIR/nocache.bin"; local tdir="$WORK_DIR/nocache-cache"
   printf 'hello' > "$f"
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C >/dev/null
   # With TUSC_NOCACHE the DEBUG trace must show the hashing step
   # ("> checksum sha256 ..."), which we suppress on cache hits.
   local out
-  out=$(TUSDIR="$tdir" TUSC_NOCACHE=1 DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+  out=$(TUSDIR="$tdir" TUSC_NOCACHE=1 DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C 2>&1) \
     || { fail "TUSC_NOCACHE run failed: $out"; return 1; }
   grep -q "^> checksum sha256" <<< "$out" \
     || { fail "expected '> checksum sha256' in DEBUG trace under TUSC_NOCACHE=1; got: $out"; return 1; }
@@ -484,9 +634,9 @@ test_restart_sends_fresh_upload_key() {
   local f="$WORK_DIR/restartkey.bin"; local tdir="$WORK_DIR/restartkey-cache"
   printf 'restartkey-content' > "$f"
   local out1 out2 k1 k2
-  out1=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+  out1=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C 2>&1) \
     || { fail "first upload failed: $out1"; return 1; }
-  out2=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C --restart 2>&1) \
+  out2=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C --restart 2>&1) \
     || { fail "restart upload failed: $out2"; return 1; }
   # Extract the Upload-Key value from each POST trace (single line
   # containing both -X POST and Upload-Key:\ <hex>).
@@ -503,7 +653,7 @@ test_locate_requires_host() {
   local f="$WORK_DIR/loc-req.bin"
   printf x > "$f"
   local out rc
-  out=$(tusc -L -f "$f" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  out=$(tusc -L -f "$f" -a sha256 -C 2>&1) && rc=0 || rc=$?
   [[ $rc -ne 0 ]] || { fail "--locate without --host unexpectedly succeeded: $out"; return 1; }
   grep -q "host required" <<< "$out" \
     || { fail "expected --host required error; got: $out"; return 1; }
@@ -530,7 +680,7 @@ test_dir_manifest_cleaned_on_interrupt() {
   local root="$WORK_DIR/manif"; local tdir="$WORK_DIR/manif-cache"
   mkdir -p "$root"
   echo aaa > "$root/x.txt"
-  TUSDIR="$tdir" tusc -H 127.0.0.1:1 -d -f "$root" -a sha256 -S -C >/dev/null 2>&1 || true
+  TUSDIR="$tdir" tusc -H 127.0.0.1:1 -d -f "$root" -a sha256 -C >/dev/null 2>&1 || true
   local leaks
   leaks=$(find "$tdir" -name 'manifest.*' 2>/dev/null | wc -l | tr -d ' ')
   [[ "$leaks" == 0 ]] || { fail "manifest.* leaked after interrupted dir upload ($leaks file(s))"; return 1; }
@@ -541,7 +691,7 @@ test_invalid_algo_rejected() {
   local f="$WORK_DIR/algo.bin"
   printf x > "$f"
   local out rc
-  out=$(TUSDIR="$WORK_DIR/algo-cache" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha999 -S -C 2>&1) && rc=0 || rc=$?
+  out=$(TUSDIR="$WORK_DIR/algo-cache" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha999 -C 2>&1) && rc=0 || rc=$?
   [[ $rc -ne 0 ]] || { fail "sha999 should be rejected; out=$out"; return 1; }
   grep -q "'sha999' not supported" <<< "$out" \
     || { fail "expected explicit rejection message for sha999; got: $out"; return 1; }
@@ -554,7 +704,7 @@ test_dir_forwards_curl_passthrough() {
   mkdir -p "$root"
   echo aaa > "$root/x.txt"
   local out
-  out=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -S -C \
+  out=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -C \
         -- -H "X-Tusc-Passthrough: yes" 2>&1) \
     || { fail "dir upload failed: $out"; return 1; }
   # Both the POST and the PATCH should include the passthrough header.
@@ -567,50 +717,223 @@ test_dir_forwards_curl_passthrough() {
   [[ "$patch_seen" -ge 1 ]] || { fail "passthrough header missing from PATCH in: $out"; return 1; }
 }
 
+test_retries_recover_from_transient_patch_failure() {
+  # First PATCH attempt is killed by the server (TCP RST mid-stream
+  # via shutdown(socket, SHUT_WR)); --retries 1 should re-HEAD, learn
+  # the server saved 0 bytes, re-slice, and try again — and succeed.
+  local port
+  port=$(require_python_stub '
+state = {"patches": 0}
+state_lock = threading.Lock()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response(201)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Location", "http://127.0.0.1:%d/files/RETRY-ID" % PORT)
+        self.send_header("Content-Length", "0"); self.end_headers()
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Upload-Offset", "0")
+        self.send_header("Upload-Length", "16")
+        self.send_header("Content-Length", "0"); self.end_headers()
+    def do_PATCH(self):
+        with state_lock:
+            state["patches"] += 1; n = state["patches"]
+        if n == 1:
+            try: self.rfile.read(4)
+            except Exception: pass
+            try: self.connection.shutdown(1); self.connection.close()
+            except Exception: pass
+            return
+        body_len = int(self.headers.get("Content-Length", "0"))
+        if body_len: self.rfile.read(body_len)
+        self.send_response(204)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Upload-Offset", str(body_len))
+        self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a, **k): pass
+') || return $((2 - $?))
+
+  local f="$WORK_DIR/retry.bin"; local tdir="$WORK_DIR/retry-cache"
+  printf 'sixteen-bytes!ok' > "$f"   # 16 bytes — matches stub's Upload-Length
+  local out rc
+  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -C --retries 1 2>&1) && rc=0 || rc=$?
+  stop_python_stub
+
+  [[ $rc -eq 0 ]] || { fail "retry run failed: $out"; return 1; }
+  grep -q "↻ chunk 1 PATCH failed (transient), retry 1/1" <<< "$out" \
+    || { fail "expected retry-1 banner; got: $out"; return 1; }
+  grep -q "Uploaded successfully" <<< "$out" \
+    || { fail "retry didn't finish the upload: $out"; return 1; }
+}
+
+test_retries_do_not_mask_4xx() {
+  # 4xx responses are not transient. --retries 5 must NOT retry on
+  # 404 — it would mask configuration / auth bugs.
+  local port
+  port=$(require_python_stub '
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response(201)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Location", "http://127.0.0.1:%d/files/X" % PORT)
+        self.send_header("Content-Length", "0"); self.end_headers()
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Upload-Offset", "0")
+        self.send_header("Upload-Length", "5")
+        self.send_header("Content-Length", "0"); self.end_headers()
+    def do_PATCH(self):
+        try: self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
+        except Exception: pass
+        self.send_response(403)
+        self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a, **k): pass
+') || return $((2 - $?))
+
+  local f="$WORK_DIR/retry4xx.bin"; local tdir="$WORK_DIR/retry4xx-cache"
+  printf 'hello' > "$f"
+  local out rc
+  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -C --retries 5 2>&1) && rc=0 || rc=$?
+  stop_python_stub
+
+  [[ $rc -ne 0 ]] || { fail "expected non-zero exit on 403; got 0 in: $out"; return 1; }
+  grep -q "HTTP 403" <<< "$out" \
+    || { fail "expected HTTP 403 in error; got: $out"; return 1; }
+  if grep -q "PATCH failed (transient), retry" <<< "$out"; then
+    fail "retried on 403; must only retry transient failures: $out"
+    return 1
+  fi
+}
+
+test_chunked_patch_uploads_in_multiple_patches() {
+  # With --chunk-size smaller than the file, the script must send
+  # multiple PATCH requests instead of one. Count PATCHes via a stub.
+  local port
+  port=$(require_python_stub '
+state = {"patches": 0, "offset": 0}
+lk = threading.Lock()
+SIZE = 200 * 1024   # 200 KiB
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response(201); self.send_header("Tus-Resumable","1.0.0")
+        self.send_header("Location","http://127.0.0.1:%d/files/CHUNKED"%PORT)
+        self.send_header("Content-Length","0"); self.end_headers()
+    def do_HEAD(self):
+        self.send_response(200); self.send_header("Tus-Resumable","1.0.0")
+        self.send_header("Upload-Offset",str(state["offset"]))
+        self.send_header("Upload-Length",str(SIZE))
+        self.send_header("Content-Length","0"); self.end_headers()
+    def do_PATCH(self):
+        bl=int(self.headers.get("Content-Length","0"))
+        if bl: self.rfile.read(bl)
+        with lk:
+            state["patches"] += 1; state["offset"] += bl; new_off = state["offset"]
+        self.send_response(204); self.send_header("Tus-Resumable","1.0.0")
+        self.send_header("Upload-Offset",str(new_off))
+        self.send_header("Content-Length","0"); self.end_headers()
+    def log_message(self,*a,**k): pass
+') || return $((2 - $?))
+
+  local f="$WORK_DIR/chunked.bin"; local tdir="$WORK_DIR/chunked-cache"
+  dd if=/dev/urandom of="$f" bs=1024 count=200 2>/dev/null   # 200 KiB
+  local out
+  out=$(TUSDIR="$tdir" DEBUG=1 tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -C \
+        --chunk-size 64K 2>&1) \
+    || { stop_python_stub; fail "chunked upload failed: $out"; return 1; }
+  stop_python_stub
+
+  # 200 KiB / 64 KiB -> 4 chunks (64 + 64 + 64 + 8).
+  local patches; patches=$(grep -c "^> curl .*--request PATCH" <<< "$out")
+  [[ "$patches" == 4 ]] \
+    || { fail "expected 4 PATCH requests for 200K / 64K chunks; got $patches in: $out"; return 1; }
+  grep -q "chunk 1/4" <<< "$out" \
+    || { fail "expected chunk progress banner; got: $out"; return 1; }
+  grep -q "Uploaded successfully" <<< "$out" \
+    || { fail "chunked upload did not print success: $out"; return 1; }
+}
+
+test_chunk_size_parser_accepts_suffixes() {
+  # --chunk-size accepts plain bytes, K, M, G suffixes (binary).
+  local f="$WORK_DIR/cs.bin"
+  printf x > "$f"
+  # Round-trip a few sizes via a tiny tusd upload; if any value is
+  # rejected the run exits non-zero.
+  for sz in 1024 64K 1M 1G; do
+    local tdir="$WORK_DIR/cs-$sz-cache"
+    TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C \
+      --chunk-size "$sz" >/dev/null \
+      || { fail "--chunk-size $sz was rejected"; return 1; }
+  done
+  # Bad sizes must error out. '0' and '0K' are positive-size violations
+  # (would divide-by-zero in the chunk-count math); 'garbage' is a
+  # parse failure. Both should fail before reaching the upload loop.
+  local rc bad
+  for bad in garbage 0 0K; do
+    TUSDIR="$WORK_DIR/cs-bad-$bad-cache" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C \
+      --chunk-size "$bad" >/dev/null 2>&1 && rc=0 || rc=$?
+    [[ $rc -ne 0 ]] || { fail "--chunk-size '$bad' should be rejected"; return 1; }
+  done
+}
+
+test_retries_inf_is_accepted() {
+  # 'inf' is the documented sentinel for unlimited retries. Just
+  # verify it parses (single-PATCH upload completes without ever
+  # tripping the retry path).
+  local f="$WORK_DIR/inf.bin"; local tdir="$WORK_DIR/inf-cache"
+  printf hello > "$f"
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C \
+    --retries inf >/dev/null \
+    || { fail "--retries inf was rejected"; return 1; }
+}
+
+test_retries_invalid_value_rejected() {
+  # Anything other than a non-negative integer or 'inf'/'infinite' must
+  # fail loudly. Silent fall-through to 0 retries would mask CLI typos.
+  local f="$WORK_DIR/badretries.bin"; local tdir="$WORK_DIR/badretries-cache"
+  printf x > "$f"
+  local rc out bad
+  for bad in garbage 3x -1 " "; do
+    out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C \
+          --retries "$bad" 2>&1) && rc=0 || rc=$?
+    [[ $rc -ne 0 ]] || { fail "--retries '$bad' should be rejected; out: $out"; return 1; }
+    grep -q -- "--retries" <<< "$out" \
+      || { fail "expected --retries error mention for '$bad'; got: $out"; return 1; }
+  done
+}
+
 test_user_w_does_not_break_effective_url_marker() {
   # A user-supplied `-- -w ...` must not override the internal -w that
   # carries %{url_effective}. Our -w goes after CURLARGS so curl picks
   # ours as the last one. Exercise via the path-relative resolution
   # path (which needs EFFECTIVE_URL) and a benign passthrough -w.
-  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
-  local port=$((40000 + RANDOM % 10000))
-  cat > "$WORK_DIR/relw-stub.py" <<PY
-import http.server, socketserver, sys
-PORT = int(sys.argv[1])
+  local port
+  port=$(require_python_stub '
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.send_response(201)
         self.send_header("Tus-Resumable", "1.0.0")
         self.send_header("Location", "uploads/W-ID")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def do_PATCH(self):
         body_len = int(self.headers.get("Content-Length", "0"))
         if body_len: self.rfile.read(body_len)
         self.send_response(204)
         self.send_header("Tus-Resumable", "1.0.0")
         self.send_header("Upload-Offset", str(body_len))
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a, **k): pass
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
-    s.serve_forever()
-PY
-  python3 "$WORK_DIR/relw-stub.py" "$port" >/dev/null 2>&1 &
-  STUB_PID=$!
-  for _ in $(seq 1 50); do
-    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
-    sleep 0.05
-  done
+') || return $((2 - $?))
 
   local f="$WORK_DIR/relw.bin"; local tdir="$WORK_DIR/relw-cache"
   printf 'with-user-w' > "$f"
   # Pass a user -w that would, if it won precedence, replace our
   # marker output and leave EFFECTIVE_URL empty.
-  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C \
+  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -C \
     -- -w '%{http_code}\n' >/dev/null 2>&1 || true
-  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+  stop_python_stub
 
   local cached; cached=$(cat "$tdir"/loc.* 2>/dev/null | head -1)
   [[ "$cached" == "http://127.0.0.1:$port/files/uploads/W-ID" ]] \
@@ -620,45 +943,29 @@ PY
 test_path_relative_location_is_resolved() {
   # Path-relative Location ("uploads/123", no leading slash) must
   # resolve against the directory of the POST URL.
-  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
-  local port=$((40000 + RANDOM % 10000))
-  cat > "$WORK_DIR/pathrel-stub.py" <<PY
-import http.server, socketserver, sys
-PORT = int(sys.argv[1])
+  local port
+  port=$(require_python_stub '
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
-        # No leading slash, no scheme. Must be resolved against
-        # http://host:port/files/ (the POST target).
         self.send_response(201)
         self.send_header("Tus-Resumable", "1.0.0")
         self.send_header("Location", "uploads/REL-ID")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def do_PATCH(self):
         body_len = int(self.headers.get("Content-Length", "0"))
         if body_len: self.rfile.read(body_len)
         self.send_response(204)
         self.send_header("Tus-Resumable", "1.0.0")
         self.send_header("Upload-Offset", str(body_len))
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a, **k): pass
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
-    s.serve_forever()
-PY
-  python3 "$WORK_DIR/pathrel-stub.py" "$port" >/dev/null 2>&1 &
-  STUB_PID=$!
-  for _ in $(seq 1 50); do
-    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
-    sleep 0.05
-  done
+') || return $((2 - $?))
 
   local f="$WORK_DIR/pathrel.bin"; local tdir="$WORK_DIR/pathrel-cache"
   printf 'path-relative-loc' > "$f"
   local rc
-  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C >/dev/null 2>&1 && rc=0 || rc=$?
-  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -C >/dev/null 2>&1 && rc=0 || rc=$?
+  stop_python_stub
 
   [[ $rc -eq 0 ]] || { fail "upload with path-relative Location failed: rc=$rc"; return 1; }
   local cached; cached=$(cat "$tdir"/loc.* 2>/dev/null | head -1)
@@ -670,44 +977,29 @@ test_relative_location_is_resolved() {
   # Per the TUS spec the server may return Location relative to HOST.
   # The script must resolve "/path/<id>" against the host's
   # scheme+authority before caching / PATCHing.
-  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
-  local port=$((40000 + RANDOM % 10000))
-  cat > "$WORK_DIR/rel-stub.py" <<PY
-import http.server, socketserver, sys
-PORT = int(sys.argv[1])
+  local port
+  port=$(require_python_stub '
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
-        # Spec-allowed relative Location.
         self.send_response(201)
         self.send_header("Tus-Resumable", "1.0.0")
         self.send_header("Location", "/files/REL-UPLOAD-ID")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def do_PATCH(self):
         body_len = int(self.headers.get("Content-Length", "0"))
         if body_len: self.rfile.read(body_len)
         self.send_response(204)
         self.send_header("Tus-Resumable", "1.0.0")
         self.send_header("Upload-Offset", str(body_len))
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a, **k): pass
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
-    s.serve_forever()
-PY
-  python3 "$WORK_DIR/rel-stub.py" "$port" >/dev/null 2>&1 &
-  STUB_PID=$!
-  for _ in $(seq 1 50); do
-    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
-    sleep 0.05
-  done
+') || return $((2 - $?))
 
   local f="$WORK_DIR/rel.bin"; local tdir="$WORK_DIR/rel-cache"
   printf 'relative-loc' > "$f"
   local out
-  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
-  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -C 2>&1) && rc=0 || rc=$?
+  stop_python_stub
 
   [[ $rc -eq 0 ]] || { fail "upload against relative-Location server failed: $out"; return 1; }
   local cached; cached=$(cat "$tdir"/loc.* 2>/dev/null | head -1)
@@ -718,35 +1010,21 @@ PY
 test_post_with_no_location_errors() {
   # A 2xx POST that omits Location is unusable — no URL to PATCH or
   # cache. Must fail loudly instead of "succeeding" with an empty URL.
-  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
-  local port=$((40000 + RANDOM % 10000))
-  cat > "$WORK_DIR/noloc-stub.py" <<PY
-import http.server, socketserver, sys
-PORT = int(sys.argv[1])
+  local port
+  port=$(require_python_stub '
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
-        # 201 but no Location header.
         self.send_response(201)
         self.send_header("Tus-Resumable", "1.0.0")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a, **k): pass
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
-    s.serve_forever()
-PY
-  python3 "$WORK_DIR/noloc-stub.py" "$port" >/dev/null 2>&1 &
-  STUB_PID=$!
-  for _ in $(seq 1 50); do
-    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
-    sleep 0.05
-  done
+') || return $((2 - $?))
 
   local f="$WORK_DIR/noloc.bin"; local tdir="$WORK_DIR/noloc-cache"
   printf 'no-loc' > "$f"
   local out rc
-  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
-  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -C 2>&1) && rc=0 || rc=$?
+  stop_python_stub
 
   [[ $rc -ne 0 ]] || { fail "expected non-zero exit when POST returns no Location; got 0, out=$out"; return 1; }
   grep -q "no Location header" <<< "$out" \
@@ -762,7 +1040,7 @@ test_debug_drops_curl_v_when_auth_present() {
   printf 'hi' > "$f"
   local out
   out=$(TUSDIR="$tdir" TUSC_USER=alice TUSC_PASS=secret DEBUG=1 \
-        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C 2>&1) \
     || { fail "auth upload failed: $out"; return 1; }
   # No curl-verbose lines (those start with "* ", e.g. "* Connected to ...").
   if grep -q "^\* " <<< "$out"; then
@@ -774,7 +1052,7 @@ test_debug_drops_curl_v_when_auth_present() {
     || { fail "expected synthetic '> curl' debug line; got: $out"; return 1; }
   # TUSC_DEBUG_UNSAFE=1 must re-enable -v.
   out=$(TUSDIR="${tdir}2" TUSC_USER=alice TUSC_PASS=secret TUSC_DEBUG_UNSAFE=1 DEBUG=1 \
-        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C 2>&1) \
     || { fail "TUSC_DEBUG_UNSAFE upload failed: $out"; return 1; }
   grep -q "^\* " <<< "$out" \
     || { fail "TUSC_DEBUG_UNSAFE=1 should re-enable curl -v; got: $out"; return 1; }
@@ -785,49 +1063,33 @@ test_relative_location_after_redirect_uses_effective_url() {
   # Location: uploads/REL-ID (path-relative, no leading slash).
   # Resolution base must be the post-redirect /v2/files/, not the
   # original /files/, so the cached URL contains /v2/files/uploads/.
-  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
-  local port=$((40000 + RANDOM % 10000))
-  cat > "$WORK_DIR/redir-rel-stub.py" <<PY
-import http.server, socketserver, sys
-PORT = int(sys.argv[1])
+  local port
+  port=$(require_python_stub '
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/files/":
             self.send_response(307)
             self.send_header("Location", "http://127.0.0.1:%d/v2/files/" % PORT)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self.send_header("Content-Length", "0"); self.end_headers()
             return
         self.send_response(201)
         self.send_header("Tus-Resumable", "1.0.0")
-        # Path-relative final Location: must resolve against /v2/files/.
         self.send_header("Location", "uploads/REL-ID")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def do_PATCH(self):
         body_len = int(self.headers.get("Content-Length", "0"))
         if body_len: self.rfile.read(body_len)
         self.send_response(204)
         self.send_header("Tus-Resumable", "1.0.0")
         self.send_header("Upload-Offset", str(body_len))
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a, **k): pass
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
-    s.serve_forever()
-PY
-  python3 "$WORK_DIR/redir-rel-stub.py" "$port" >/dev/null 2>&1 &
-  STUB_PID=$!
-  for _ in $(seq 1 50); do
-    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
-    sleep 0.05
-  done
+') || return $((2 - $?))
 
   local f="$WORK_DIR/redir-rel.bin"; local tdir="$WORK_DIR/redir-rel-cache"
   printf 'redir-relative' > "$f"
-  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C >/dev/null 2>&1 || true
-  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -C >/dev/null 2>&1 || true
+  stop_python_stub
 
   local cached; cached=$(cat "$tdir"/loc.* 2>/dev/null | head -1)
   [[ "$cached" == "http://127.0.0.1:$port/v2/files/uploads/REL-ID" ]] \
@@ -837,50 +1099,33 @@ PY
 test_header_returns_final_response_after_redirect() {
   # When the POST is redirected before the final 201, header() must
   # return the final response's Location, not the redirect's.
-  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
-  local port=$((40000 + RANDOM % 10000))
-  cat > "$WORK_DIR/redir-stub.py" <<PY
-import http.server, socketserver, sys
-PORT = int(sys.argv[1])
+  local port
+  port=$(require_python_stub '
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
-        # Redirect once; curl -L will follow with another POST.
         if self.path == "/files/":
             self.send_response(307)
             self.send_header("Location", "http://127.0.0.1:%d/v2/files/" % PORT)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self.send_header("Content-Length", "0"); self.end_headers()
             return
-        # Final POST: TUS 201 with the canonical upload URL.
         self.send_response(201)
         self.send_header("Tus-Resumable", "1.0.0")
         self.send_header("Location", "http://127.0.0.1:%d/v2/files/REAL-UPLOAD-ID" % PORT)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def do_PATCH(self):
         body_len = int(self.headers.get("Content-Length", "0"))
         if body_len: self.rfile.read(body_len)
         self.send_response(204)
         self.send_header("Tus-Resumable", "1.0.0")
         self.send_header("Upload-Offset", str(body_len))
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a, **k): pass
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
-    s.serve_forever()
-PY
-  python3 "$WORK_DIR/redir-stub.py" "$port" >/dev/null 2>&1 &
-  STUB_PID=$!
-  for _ in $(seq 1 50); do
-    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
-    sleep 0.05
-  done
+') || return $((2 - $?))
 
   local f="$WORK_DIR/redir.bin"; local tdir="$WORK_DIR/redir-cache"
   printf 'redir-payload' > "$f"
-  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C >/dev/null 2>&1 || true
-  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -C >/dev/null 2>&1 || true
+  stop_python_stub
 
   # The cache must hold the FINAL URL, not the redirect target.
   local cached
@@ -897,7 +1142,7 @@ test_debug_masks_password_with_metacharacters() {
   local pw='p w$x"y'   # space + $ + " — all need shell escaping
   local out
   out=$(TUSDIR="$tdir" TUSC_USER=alice TUSC_PASS="$pw" DEBUG=1 \
-        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C 2>&1) \
     || { fail "debug-mask upload failed: $out"; return 1; }
   # printf %q escapes *, so the trace shows alice:\*\*\* — strip the
   # backslashes before checking the masked form is present.
@@ -917,7 +1162,7 @@ test_env_var_credentials() {
   dd if=/dev/urandom of="$f" bs=1024 count=16 2>/dev/null
   local out
   out=$(TUSDIR="$tdir" TUSC_USER=alice TUSC_PASS=secret DEBUG=1 \
-        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C 2>&1) \
     || { fail "env-auth upload failed: $out"; return 1; }
   # printf %q escapes the * characters, so the trace shows
   # `--user alice:\*\*\*`. Strip backslashes before grepping.
@@ -956,78 +1201,55 @@ test_resume_announces_offset() {
   seed_loc_cache "$tdir" "$f" "$TUSD_HOST:$TUSD_PORT" "/files/" "resume.bin" "$loc"
 
   local out
-  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C)
+  out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C)
   grep -q "Resuming at byte 524288" <<< "$out" \
     || { fail "expected resume message at byte 524288; got: $out"; return 1; }
   grep -q "Uploaded successfully" <<< "$out" \
     || { fail "resume run did not finish; got: $out"; return 1; }
 }
 
-# Stub server for the next two tests: returns malicious Location on POST
-# and 500 on HEAD. Lets us exercise script paths that depend on the
-# server behavior tusd won't reproduce on its own.
-start_stub_server() { # $1 = port
-  local port="$1"
-  cat > "$WORK_DIR/stub.py" <<PY
-import http.server, socketserver, sys
-PORT = int(sys.argv[1])
-# Crafted Location with shell metacharacters. If tusc.sh re-parses this
-# through a shell (the historical bash -c bug), the touch fires.
-EVIL = "http://127.0.0.1:%d/uploads/abc'\\; touch '$WORK_DIR/PWNED' \\;echo '" % PORT
+# Stub body used by the next two tests: returns a shell-metacharacter-
+# laden Location on POST (canary for the bash-c argv bug) and always
+# returns 500 on HEAD (covers "non-404 HEAD must surface").
+EVIL_HEAD500_STUB='
+EVIL = "http://127.0.0.1:%d/uploads/abc\x27\\; touch \x27'"$WORK_DIR"'/PWNED\x27 \\;echo \x27" % PORT
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.send_response(201)
-        self.send_header('Tus-Resumable', '1.0.0')
-        self.send_header('Location', EVIL)
-        self.send_header('Content-Length', '0')
-        self.end_headers()
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Location", EVIL)
+        self.send_header("Content-Length", "0"); self.end_headers()
     def do_HEAD(self):
-        # Always 500 — exercise the "non-404 HEAD must surface" path.
         self.send_response(500)
-        self.send_header('Tus-Resumable', '1.0.0')
-        self.send_header('Content-Length', '0')
-        self.end_headers()
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a, **k): pass
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(('127.0.0.1', PORT), H) as s:
-    s.serve_forever()
-PY
-  python3 "$WORK_DIR/stub.py" "$port" >/dev/null 2>&1 &
-  STUB_PID=$!
-  # Give the stub a moment to come up.
-  for _ in $(seq 1 50); do
-    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
-    sleep 0.05
-  done
-  return 0
-}
+'
 
 test_shell_injection_canary() {
-  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
-  local port=$((40000 + RANDOM % 10000))
-  start_stub_server "$port"
+  local port
+  port=$(require_python_stub "$EVIL_HEAD500_STUB") || return $((2 - $?))
   local tdir="$WORK_DIR/inj-cache"
   rm -f "$WORK_DIR/PWNED"
   printf hello > "$WORK_DIR/inj.bin"
   # POST returns a Location with embedded shell, then tusc.sh PATCHes
   # against it. Before the argv-array fix this triggered a `touch`.
-  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$WORK_DIR/inj.bin" -a sha256 -S -C >/dev/null 2>&1 || true
-  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$WORK_DIR/inj.bin" -a sha256 -C >/dev/null 2>&1 || true
+  stop_python_stub
   [[ ! -e "$WORK_DIR/PWNED" ]] || fail "shell injection from server-controlled Location succeeded"
 }
 
 test_head_5xx_surfaces_error() {
-  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
-  local port=$((40000 + RANDOM % 10000))
-  start_stub_server "$port"
+  local port
+  port=$(require_python_stub "$EVIL_HEAD500_STUB") || return $((2 - $?))
   local tdir="$WORK_DIR/head500-cache"; mkdir -p "$tdir"
   printf payload > "$WORK_DIR/head500.bin"
   seed_loc_cache "$tdir" "$WORK_DIR/head500.bin" "127.0.0.1:$port" "/files/" "head500.bin" \
     "http://127.0.0.1:$port/files/seeded"
 
   local out rc
-  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$WORK_DIR/head500.bin" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
-  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$WORK_DIR/head500.bin" -a sha256 -C 2>&1) && rc=0 || rc=$?
+  stop_python_stub
 
   [[ $rc -ne 0 ]] || fail "expected non-zero exit on HEAD 500; got rc=$rc"
   grep -q "Request failed: HTTP 500" <<< "$out" \
@@ -1039,7 +1261,7 @@ test_errors_go_to_stderr() {
   local tdir="$WORK_DIR/stderr-cache"
   printf x > "$WORK_DIR/stderr.bin"
   local sout serr
-  TUSDIR="$tdir" tusc -H "127.0.0.1:1" -f "$WORK_DIR/stderr.bin" -a sha256 -S -C \
+  TUSDIR="$tdir" tusc -H "127.0.0.1:1" -f "$WORK_DIR/stderr.bin" -a sha256 -C \
     > "$WORK_DIR/stderr-out" 2> "$WORK_DIR/stderr-err" || true
   sout=$(cat "$WORK_DIR/stderr-out")
   serr=$(cat "$WORK_DIR/stderr-err")
@@ -1054,13 +1276,14 @@ run "binary round-trip"                test_binary_roundtrip
 run "text round-trip"                  test_text_roundtrip
 run "cache-hit prints Already uploaded" test_cache_hit_message
 run "--restart creates a fresh upload" test_restart_replaces_upload
-run "stale cache URL recovers"         test_stale_cache_url_recovers
+run "done marker beats server 404; --restart overrides" test_done_marker_trusts_local_state_over_server_404
 run "-d preserves relative paths in metadata" test_dir_upload_preserves_paths
 run "0-byte file uploads cleanly (skips empty PATCH)" test_zero_byte_file
 run "resume works from read-only source directory" test_resume_from_readonly_source_dir
 run "path with spaces survives quoting"            test_path_with_spaces
 run "identical content at different paths uploads twice" test_identical_content_different_names
 run "-N override sets Upload-Metadata.filename" test_name_override
+run "-d re-run skips already-completed files"             test_dir_rerun_skips_completed_files
 run "-d prints per-file success + URL; no tempfile leak"  test_dir_per_file_success_and_cleanup
 run "-d honors set -e inside the per-file subshell"       test_dir_set_e_honored_inside_subshell
 run "-d forwards -- curl passthrough args to children" test_dir_forwards_curl_passthrough
@@ -1076,6 +1299,12 @@ run "invalid --algo is rejected by whitelist"              test_invalid_algo_rej
 run "absolute-path Location is resolved against host"      test_relative_location_is_resolved
 run "path-relative Location resolves against POST URL dir" test_path_relative_location_is_resolved
 run "user -- -w doesn't break internal EFFECTIVE_URL marker" test_user_w_does_not_break_effective_url_marker
+run "--chunk-size sends multiple PATCH requests"            test_chunked_patch_uploads_in_multiple_patches
+run "--chunk-size accepts K/M/G suffixes; rejects junk"     test_chunk_size_parser_accepts_suffixes
+run "--retries inf is accepted"                              test_retries_inf_is_accepted
+run "--retries with invalid values is rejected"              test_retries_invalid_value_rejected
+run "--retries recovers from a transient PATCH failure"     test_retries_recover_from_transient_patch_failure
+run "--retries does NOT mask 4xx responses"                 test_retries_do_not_mask_4xx
 run "POST that returns no Location errors out"             test_post_with_no_location_errors
 run "DEBUG drops curl -v when auth creds are in use"       test_debug_drops_curl_v_when_auth_present
 run "header() returns final response Location after redirect" test_header_returns_final_response_after_redirect

@@ -112,6 +112,12 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
     -C --no-color  Donot color the output (Useful for parsing output).
     -f --file      The file to upload (or directory, with -d).
     -R --restart   Ignore the cached upload URL; start a fresh upload.
+       --retries N Retry a PATCH up to N times on transient failures
+                   (transport error or 5xx). Default 'inf' (never give up
+                   on transient errors). Pass 0 to fail immediately.
+       --chunk-size SIZE  Split the upload into PATCHes of SIZE bytes
+                   (accepts K/M/G suffix). Default 50M. Smaller chunks
+                   survive flaky LBs and idle-timeouts better.
     -N --name      Override the filename sent in Upload-Metadata.
                    (May contain slashes; server gets the literal value.)
     -d --dir       Treat --file as a directory; upload every file under it,
@@ -119,7 +125,6 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
     -h --help      Show help information and usage.
     -H --host      The tus-server host where file is uploaded.
     -L --locate    Locate the uploaded file in tus-server.
-    -S --no-spin   Donot show the spinner (Useful for parsing output).
     -u --update    Update tusc to latest version.
        --version   Print the current tusc version.
 
@@ -145,10 +150,10 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
     tusc.sh -H 0:1080 -f ww.mp4 -b /store/   # uploads ww.mp4 to http://0.0.0.0:1080/store/
 ```
 
-If you want to parse the output of `tusc`, pass in `-C` (no color) and `-S` (no spin) flags. Eg:
+If you want to parse the output of `tusc`, pass in `-C` (no color). Eg:
 ```sh
 # Locate the URL of a file and download it
-wget $(tusc -H 0:1080 -f ww.mp4 -L -S -C | cut -c 6-999) -O ww.mp4.1
+wget $(tusc -H 0:1080 -f ww.mp4 -L -C | cut -c 6-999) -O ww.mp4.1
 ```
 
 ### Authentication
