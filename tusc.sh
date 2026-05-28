@@ -202,7 +202,7 @@ usage()
                      $(line 'PASS="my_pass"' 36)
     $(info "-C --no-color")  $(comment "Donot color the output (Useful for parsing output).")
     $(info "-f --file")      $(comment "The file to upload (or directory, with -d).")
-    $(info "-F --force")     $(comment "Ignore the cached upload URL; start a fresh upload.")
+    $(info "-R --restart")   $(comment "Ignore the cached upload URL; start a fresh upload.")
     $(info "-N --name")      $(comment "Override the filename sent in Upload-Metadata.")
                    $(comment "(May contain slashes; server gets the literal value.)")
     $(info "-d --dir")       $(comment "Treat --file as a directory; upload every file under it,")
@@ -342,16 +342,18 @@ request()
   fi
   cmd+=(-L -D "$HEADER" -H "Tus-Resumable: 1.0.0")
   [[ $HAS_AUTH ]] && cmd+=(--basic --user "$CRED_USER:$CRED_PASS")
-  # Append %{url_effective} to stdout so we can resolve a relative
-  # Location against the post-redirect URL, not the original target.
-  # Wrapped in markers so we can pull it back out without confusing
-  # it for response body bytes.
-  local URL_MARK="__TUSC_URL_EFFECTIVE_3f4d29__"
-  cmd+=(-w "${URL_MARK}%{url_effective}${URL_MARK}")
   # CURLARGS is a user-supplied passthrough captured as an array from
   # the "--" sentinel during argv parsing. Safe to splat directly.
   [[ ${#CURLARGS[@]} -gt 0 ]] && cmd+=("${CURLARGS[@]}")
   cmd+=("$@")
+  # Append %{url_effective} to stdout so we can resolve a relative
+  # Location against the post-redirect URL, not the original target.
+  # Wrapped in markers so we can pull it back out without confusing
+  # it for response body bytes. Goes AFTER CURLARGS so a user-supplied
+  # `-- -w ...` doesn't override ours (curl uses the last -w on the
+  # command line).
+  local URL_MARK="__TUSC_URL_EFFECTIVE_3f4d29__"
+  cmd+=(-w "${URL_MARK}%{url_effective}${URL_MARK}")
 
   if [[ $DEBUG ]]; then
     # Mask the password BEFORE shell-quoting. Doing it after `printf %q`
@@ -479,7 +481,7 @@ report_success()
 {
   REPORTED=1
   if [[ $SKIPPED ]]; then
-    ok "ℹ Already uploaded — skipping (re-run with --force to overwrite)."
+    ok "ℹ Already uploaded — skipping (re-run with --restart to overwrite)."
   else
     ok "✔ Uploaded successfully!"
   fi
@@ -517,7 +519,7 @@ while [[ $# -gt 0 ]]; do
     -H | --host) HOST="$2"; shift 2 ;;
     -L | --locate) LOCATE=1; shift ;;
     -S | --no-spin) NOSPIN=1; shift ;;
-    -F | --force) FORCE=1; shift ;;
+    -R | --restart) RESTART=1; shift ;;
     -d | --dir) DIRMODE=1; shift ;;
     -N | --name) NAME_OVERRIDE="$2"; shift 2 ;;
     -u | --update) update; exit 0 ;;
@@ -613,13 +615,13 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
 
   TUSURL=$(cache-loc-get "$HOST$BASEPATH" "$UPLOAD_KEY")
 
-  # --force needs to (a) ignore the cached URL and (b) send a fresh
+  # --restart needs to (a) ignore the cached URL and (b) send a fresh
   # Upload-Key so a server that dedupes on it creates a new upload
   # instead of handing back the existing one. POST_UPLOAD_KEY carries
-  # an extra nonce on force; the local cache (and resume on later
-  # non-force runs) still keys on the canonical UPLOAD_KEY.
+  # an extra nonce on restart; the local cache (and resume on later
+  # non-restart runs) still keys on the canonical UPLOAD_KEY.
   POST_UPLOAD_KEY=$UPLOAD_KEY
-  if [[ $FORCE ]]; then
+  if [[ $RESTART ]]; then
     TUSURL=""
     POST_UPLOAD_KEY="$UPLOAD_KEY-$(printf '%s%s%s' "$$" "$RANDOM" "$(date +%s%N 2>/dev/null || date +%s)" | hash_stdin_hex sha1 | cut -c1-16)"
   fi

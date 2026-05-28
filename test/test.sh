@@ -186,14 +186,14 @@ test_cache_hit_message() {
   grep -q "Already uploaded" <<< "$out" || fail "expected 'Already uploaded' on cache hit; got: $out"
 }
 
-test_force_replaces_upload() {
-  local f="$WORK_DIR/force.bin"; local tdir="$WORK_DIR/force-cache"
+test_restart_replaces_upload() {
+  local f="$WORK_DIR/restart.bin"; local tdir="$WORK_DIR/restart-cache"
   dd if=/dev/urandom of="$f" bs=1024 count=64 2>/dev/null
   local u1 u2
   u1=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C | extract_url)
-  u2=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C --force | extract_url)
+  u2=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C --restart | extract_url)
   [[ -n "$u1" && -n "$u2" ]] || fail "missing URL on one of the runs: u1=$u1 u2=$u2"
-  [[ "$u1" != "$u2" ]] || fail "--force did not create a fresh upload (same URL: $u1)"
+  [[ "$u1" != "$u2" ]] || fail "--restart did not create a fresh upload (same URL: $u1)"
 }
 
 test_stale_cache_url_recovers() {
@@ -477,23 +477,23 @@ test_tusc_nocache_forces_rehash() {
     || { fail "expected '> checksum sha256' in DEBUG trace under TUSC_NOCACHE=1; got: $out"; return 1; }
 }
 
-test_force_sends_fresh_upload_key() {
-  # --force must send a different Upload-Key on POST (otherwise a
+test_restart_sends_fresh_upload_key() {
+  # --restart must send a different Upload-Key on POST (otherwise a
   # content-deduping server would hand back the old upload). Inspect
-  # DEBUG traces for the unforced vs forced POSTs and compare keys.
-  local f="$WORK_DIR/forcekey.bin"; local tdir="$WORK_DIR/forcekey-cache"
-  printf 'forcekey-content' > "$f"
+  # DEBUG traces for the normal vs restart POSTs and compare keys.
+  local f="$WORK_DIR/restartkey.bin"; local tdir="$WORK_DIR/restartkey-cache"
+  printf 'restartkey-content' > "$f"
   local out1 out2 k1 k2
   out1=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
     || { fail "first upload failed: $out1"; return 1; }
-  out2=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C --force 2>&1) \
-    || { fail "forced upload failed: $out2"; return 1; }
+  out2=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C --restart 2>&1) \
+    || { fail "restart upload failed: $out2"; return 1; }
   # Extract the Upload-Key value from each POST trace (single line
   # containing both -X POST and Upload-Key:\ <hex>).
   k1=$(grep -- "-X POST" <<< "$out1" | grep -oE 'Upload-Key:[\\ ]*[a-f0-9-]+' | head -1)
   k2=$(grep -- "-X POST" <<< "$out2" | grep -oE 'Upload-Key:[\\ ]*[a-f0-9-]+' | head -1)
   [[ -n "$k1" && -n "$k2" ]] || { fail "could not find Upload-Key in POST trace; out1=$out1 out2=$out2"; return 1; }
-  [[ "$k1" != "$k2" ]] || { fail "--force used the same Upload-Key on POST ($k1)"; return 1; }
+  [[ "$k1" != "$k2" ]] || { fail "--restart used the same Upload-Key on POST ($k1)"; return 1; }
 }
 
 test_locate_requires_host() {
@@ -567,10 +567,59 @@ test_dir_forwards_curl_passthrough() {
   [[ "$patch_seen" -ge 1 ]] || { fail "passthrough header missing from PATCH in: $out"; return 1; }
 }
 
+test_user_w_does_not_break_effective_url_marker() {
+  # A user-supplied `-- -w ...` must not override the internal -w that
+  # carries %{url_effective}. Our -w goes after CURLARGS so curl picks
+  # ours as the last one. Exercise via the path-relative resolution
+  # path (which needs EFFECTIVE_URL) and a benign passthrough -w.
+  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
+  local port=$((40000 + RANDOM % 10000))
+  cat > "$WORK_DIR/relw-stub.py" <<PY
+import http.server, socketserver, sys
+PORT = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response(201)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Location", "uploads/W-ID")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def do_PATCH(self):
+        body_len = int(self.headers.get("Content-Length", "0"))
+        if body_len: self.rfile.read(body_len)
+        self.send_response(204)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Upload-Offset", str(body_len))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a, **k): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
+    s.serve_forever()
+PY
+  python3 "$WORK_DIR/relw-stub.py" "$port" >/dev/null 2>&1 &
+  STUB_PID=$!
+  for _ in $(seq 1 50); do
+    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
+    sleep 0.05
+  done
+
+  local f="$WORK_DIR/relw.bin"; local tdir="$WORK_DIR/relw-cache"
+  printf 'with-user-w' > "$f"
+  # Pass a user -w that would, if it won precedence, replace our
+  # marker output and leave EFFECTIVE_URL empty.
+  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C \
+    -- -w '%{http_code}\n' >/dev/null 2>&1 || true
+  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+
+  local cached; cached=$(cat "$tdir"/loc.* 2>/dev/null | head -1)
+  [[ "$cached" == "http://127.0.0.1:$port/files/uploads/W-ID" ]] \
+    || { fail "user -- -w broke EFFECTIVE_URL resolution; cached: $cached"; return 1; }
+}
+
 test_path_relative_location_is_resolved() {
-  # Per RFC 3986 a path-relative Location ("uploads/123") resolves
-  # against the *directory* of the POST URL — not by string-prefixing
-  # the host. Tests the script handles the no-leading-slash form.
+  # Path-relative Location ("uploads/123", no leading slash) must
+  # resolve against the directory of the POST URL.
   command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
   local port=$((40000 + RANDOM % 10000))
   cat > "$WORK_DIR/pathrel-stub.py" <<PY
@@ -786,10 +835,8 @@ PY
 }
 
 test_header_returns_final_response_after_redirect() {
-  # When the server 302s the POST to a different URL that then returns
-  # the real Location, header() must report the *final* response's
-  # Location — not the intermediate redirect's. curl writes every
-  # response's headers into the dump file.
+  # When the POST is redirected before the final 201, header() must
+  # return the final response's Location, not the redirect's.
   command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
   local port=$((40000 + RANDOM % 10000))
   cat > "$WORK_DIR/redir-stub.py" <<PY
@@ -843,10 +890,8 @@ PY
 }
 
 test_debug_masks_password_with_metacharacters() {
-  # DEBUG trace must mask the password even when it contains shell
-  # metachars. Pre-fix the script substituted the raw password into
-  # the post-quoted argv string, so e.g. "a b" — printed as "a\ b"
-  # by printf %q — slipped through unmasked.
+  # DEBUG must mask passwords containing shell metacharacters
+  # (space, $, "), not just plain ones.
   local f="$WORK_DIR/maskmeta.bin"; local tdir="$WORK_DIR/maskmeta-cache"
   dd if=/dev/urandom of="$f" bs=1024 count=4 2>/dev/null
   local pw='p w$x"y'   # space + $ + " — all need shell escaping
@@ -1008,7 +1053,7 @@ test_errors_go_to_stderr() {
 run "binary round-trip"                test_binary_roundtrip
 run "text round-trip"                  test_text_roundtrip
 run "cache-hit prints Already uploaded" test_cache_hit_message
-run "--force creates a fresh upload"   test_force_replaces_upload
+run "--restart creates a fresh upload" test_restart_replaces_upload
 run "stale cache URL recovers"         test_stale_cache_url_recovers
 run "-d preserves relative paths in metadata" test_dir_upload_preserves_paths
 run "0-byte file uploads cleanly (skips empty PATCH)" test_zero_byte_file
@@ -1023,13 +1068,14 @@ run "--creds file with only PASS is rejected"              test_creds_file_requi
 run "checksum cache invalidates on size change"            test_checksum_cache_invalidates_on_size_change
 run "checksum cache invalidates on same-second rewrite"    test_checksum_cache_invalidates_on_subsecond_rewrite
 run "TUSC_NOCACHE bypasses the checksum cache"             test_tusc_nocache_forces_rehash
-run "--force sends a fresh Upload-Key on POST"             test_force_sends_fresh_upload_key
+run "--restart sends a fresh Upload-Key on POST"           test_restart_sends_fresh_upload_key
 run "--locate requires --host"                             test_locate_requires_host
 run "UPLOAD_KEY differs across host and base-path"          test_upload_key_includes_destination
 run "-d manifest is cleaned up even on interrupt"          test_dir_manifest_cleaned_on_interrupt
 run "invalid --algo is rejected by whitelist"              test_invalid_algo_rejected
 run "absolute-path Location is resolved against host"      test_relative_location_is_resolved
 run "path-relative Location resolves against POST URL dir" test_path_relative_location_is_resolved
+run "user -- -w doesn't break internal EFFECTIVE_URL marker" test_user_w_does_not_break_effective_url_marker
 run "POST that returns no Location errors out"             test_post_with_no_location_errors
 run "DEBUG drops curl -v when auth creds are in use"       test_debug_drops_curl_v_when_auth_present
 run "header() returns final response Location after redirect" test_header_returns_final_response_after_redirect

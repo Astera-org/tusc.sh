@@ -111,7 +111,7 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
                      PASS="my_pass"
     -C --no-color  Donot color the output (Useful for parsing output).
     -f --file      The file to upload (or directory, with -d).
-    -F --force     Ignore the cached upload URL; start a fresh upload.
+    -R --restart   Ignore the cached upload URL; start a fresh upload.
     -N --name      Override the filename sent in Upload-Metadata.
                    (May contain slashes; server gets the literal value.)
     -d --dir       Treat --file as a directory; upload every file under it,
