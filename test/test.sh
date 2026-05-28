@@ -335,6 +335,24 @@ test_name_override() {
   [[ $found -eq 1 ]] || fail "Upload-Metadata.filename did not honor --name override"
 }
 
+test_env_var_credentials() {
+  # TUSC_USER + TUSC_PASS in the env should populate the basic-auth
+  # header just like --creds <file> does.
+  local f="$WORK_DIR/auth.bin"; local tdir="$WORK_DIR/auth-cache"
+  dd if=/dev/urandom of="$f" bs=1024 count=16 2>/dev/null
+  local out
+  # DEBUG=1 prints the curl invocation with the password masked as
+  # `***`; presence of `--user 'alice:***'` confirms the env creds
+  # were picked up and threaded into curl's argv.
+  out=$(TUSDIR="$tdir" TUSC_USER=alice TUSC_PASS=secret DEBUG=1 \
+        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+    || { fail "env-auth upload failed: $out"; return 1; }
+  grep -q -- "--user alice:\\*\\*\\*" <<< "$out" \
+    || { fail "expected --user alice:*** in DEBUG output (env creds not picked up); got: $out"; return 1; }
+  grep -q "Uploaded successfully" <<< "$out" \
+    || { fail "env-auth upload did not print success: $out"; return 1; }
+}
+
 test_resume_announces_offset() {
   # Manually create a TUS upload, PATCH half of it, then seed tusc's
   # cache to point at that URL. tusc should announce the resume offset
@@ -485,6 +503,7 @@ run "resume works from read-only source directory" test_resume_from_readonly_sou
 run "path with spaces survives quoting"            test_path_with_spaces
 run "identical content at different paths uploads twice" test_identical_content_different_names
 run "-N override sets Upload-Metadata.filename" test_name_override
+run "TUSC_USER/TUSC_PASS env creds are honored" test_env_var_credentials
 run "resume announces byte offset"     test_resume_announces_offset
 run "shell-injection canary stays cold" test_shell_injection_canary
 run "HEAD 5xx surfaces as error"       test_head_5xx_surfaces_error

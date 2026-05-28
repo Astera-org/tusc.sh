@@ -6,7 +6,7 @@
 #   Jitendra Adhikari <jiten.adhikary@gmail.com>
 #
 # Contributors:
-#   Astera Institute <https://astera.org>  (macOS portability, jq removal)
+#   Astera Institute <https://astera.org>
 #
 # Originally hosted at https://github.com/adhocore/tusc.sh
 #
@@ -130,6 +130,8 @@ usage()
     $(info "DEBUG=1")        $(comment "Verbose curl + show debug headers on stderr.")
     $(info "TUSDIR")         $(comment "Cache dir for resume state and file checksums.")
                    $(comment "(Default: \$TMPDIR/tusc.<uid>/. Delete to force a fresh upload.)")
+    $(info "TUSC_USER")      $(comment "Basic-auth username (alternative to --creds file).")
+    $(info "TUSC_PASS")      $(comment "Basic-auth password (paired with TUSC_USER).")
 
   $(ok Examples:)
     $TUSC --help                           # shows this help
@@ -250,7 +252,7 @@ request()
     cmd+=(-sS)
   fi
   cmd+=(-L -D "$HEADER" -H "Tus-Resumable: 1.0.0")
-  [[ $CREDS ]] && cmd+=(--basic --user "$USER:$PASS")
+  [[ $HAS_AUTH ]] && cmd+=(--basic --user "$USER:$PASS")
   # CURLARGS is a user-supplied passthrough captured as an array from
   # the "--" sentinel during argv parsing. Safe to splat directly.
   [[ ${#CURLARGS[@]} -gt 0 ]] && cmd+=("${CURLARGS[@]}")
@@ -259,7 +261,7 @@ request()
   if [[ $DEBUG ]]; then
     local pretty
     pretty=$(printf '%q ' "${cmd[@]}")
-    [[ $CREDS ]] && pretty=${pretty//$PASS/***}
+    [[ $HAS_AUTH ]] && pretty=${pretty//$PASS/***}
     debug "> $pretty"
   fi
 
@@ -405,7 +407,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ $CREDS ]] && { [[ -f $CREDS ]] && source $CREDS && [[ $PASS ]] || error "--creds file couldn't be loaded" 1; }
+# Credentials: prefer --creds <file>; fall back to TUSC_USER+TUSC_PASS
+# env vars so callers can avoid putting secrets on disk. HAS_AUTH is
+# the script-internal flag the rest of the code checks; CREDS stays
+# meaning "a creds file path was given" so the dir-mode re-exec
+# doesn't try to propagate a fake path. Env vars are inherited by
+# children automatically.
+if [[ $CREDS ]]; then
+  [[ -f $CREDS ]] && source $CREDS && [[ $PASS ]] || error "--creds file couldn't be loaded" 1
+  HAS_AUTH=1
+elif [[ -n "${TUSC_USER:-}" && -n "${TUSC_PASS:-}" ]]; then
+  USER=$TUSC_USER
+  PASS=$TUSC_PASS
+  HAS_AUTH=1
+fi
 [[ $HOST ]] || [[ $LOCATE ]] || error "--host required" 1
 [[ $FILE ]] || error "--file required" 1
 
@@ -514,7 +529,7 @@ if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
 else
   OFFSET=0 LEFTOVER=$SIZE
   META="filename $(printf %s "$NAME" | b64)"
-  [[ $CREDS ]] && META="$META,user $(printf %s "$USER" | b64)"
+  [[ $HAS_AUTH ]] && META="$META,user $(printf %s "$USER" | b64)"
   # No Upload-Checksum on the POST: the create request has no body.
   request \
     -H "Upload-Length: $SIZE" \
