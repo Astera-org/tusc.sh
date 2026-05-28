@@ -335,6 +335,28 @@ test_name_override() {
   [[ $found -eq 1 ]] || fail "Upload-Metadata.filename did not honor --name override"
 }
 
+test_dir_forwards_curl_passthrough() {
+  # Curl passthrough args (everything after `--`) must reach the
+  # per-file curl invocation in dir mode, not just single-file mode.
+  # Pre-refactor the dir-mode re-exec dropped CURLARGS entirely, so
+  # `-d -- -H "X-Foo: bar"` silently lost the X-Foo header.
+  local root="$WORK_DIR/dirfwd"; local tdir="$WORK_DIR/dirfwd-cache"
+  mkdir -p "$root"
+  echo aaa > "$root/x.txt"
+  local out
+  out=$(TUSDIR="$tdir" DEBUG=1 tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -S -C \
+        -- -H "X-Tusc-Passthrough: yes" 2>&1) \
+    || { fail "dir upload failed: $out"; return 1; }
+  # Both the POST and the PATCH should include the passthrough header.
+  # The DEBUG trace renders argv via printf %q, which backslash-escapes
+  # the space in "X-Tusc-Passthrough: yes" — so match on the name only.
+  local post_seen patch_seen
+  post_seen=$(grep -c -- "X-Tusc-Passthrough.*-X POST" <<< "$out")
+  patch_seen=$(grep -c -- "X-Tusc-Passthrough.*--request PATCH" <<< "$out")
+  [[ "$post_seen" -ge 1 ]] || { fail "passthrough header missing from POST in: $out"; return 1; }
+  [[ "$patch_seen" -ge 1 ]] || { fail "passthrough header missing from PATCH in: $out"; return 1; }
+}
+
 test_env_var_credentials() {
   # TUSC_USER + TUSC_PASS in the env should populate the basic-auth
   # header just like --creds <file> does.
@@ -503,6 +525,7 @@ run "resume works from read-only source directory" test_resume_from_readonly_sou
 run "path with spaces survives quoting"            test_path_with_spaces
 run "identical content at different paths uploads twice" test_identical_content_different_names
 run "-N override sets Upload-Metadata.filename" test_name_override
+run "-d forwards -- curl passthrough args to children" test_dir_forwards_curl_passthrough
 run "TUSC_USER/TUSC_PASS env creds are honored" test_env_var_credentials
 run "resume announces byte offset"     test_resume_announces_offset
 run "shell-injection canary stays cold" test_shell_injection_canary

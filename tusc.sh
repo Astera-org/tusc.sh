@@ -39,14 +39,23 @@ fi
 # unwrapped base64 (BSD base64 has no -w, GNU wraps at 76 by default)
 b64() { base64 | tr -d '\n'; }
 
-# ${algo}sum fallback to shasum (macOS ships shasum, not sha1sum/sha256sum)
-checksum() # $1 = algo (sha1|sha256|...), $2 = file -> prints "<hex>  <file>"
+# Hex-digest helpers. Prefer `<algo>sum` (Linux) and fall back to
+# `shasum -a <N>` (macOS, ships shasum but not sha1sum/sha256sum).
+hash_file_hex() # $1 = algo (sha1|sha256|...), $2 = file -> "<hex>"
 {
   if command -v "${1}sum" >/dev/null 2>&1; then
     "${1}sum" "$2"
   else
     shasum -a "${1#sha}" "$2"
-  fi
+  fi | awk '{print $1}'
+}
+hash_stdin_hex() # $1 = algo, reads stdin -> "<hex>"
+{
+  if command -v "${1}sum" >/dev/null 2>&1; then
+    "${1}sum"
+  else
+    shasum -a "${1#sha}"
+  fi | awk '{print $1}'
 }
 
 # Base64-of-raw-digest for the TUS Upload-Checksum header. Per
@@ -156,14 +165,7 @@ if [[ -z "${TUSDIR:-}" ]]; then
 fi
 
 # Hash an arbitrary string to a hex digest, for use as a filename.
-strhash() # $1 = string
-{
-  if command -v sha1sum >/dev/null 2>&1; then
-    printf %s "$1" | sha1sum | awk '{print $1}'
-  else
-    printf %s "$1" | shasum -a 1 | awk '{print $1}'
-  fi
-}
+strhash() { printf %s "$1" | hash_stdin_hex sha1; }
 
 # Cached file checksum (skip rehashing on resume).
 cache-checksum-get() # $1 = "<file>:<mtime>", $2 = algo
@@ -197,11 +199,6 @@ ensure-tusdir()
   [[ -d "$TUSDIR" ]] && return 0
   mkdir -p "$TUSDIR"
   chmod 700 "$TUSDIR"
-}
-
-locate() # $1 = HOST, $2 = BASEPATH, $3 = key
-{
-  cache-loc-get "$1$2" "$3"
 }
 
 # Carve the tail of a file starting at byte offset $1 into a temp file
@@ -424,177 +421,166 @@ fi
 [[ $HOST ]] || [[ $LOCATE ]] || error "--host required" 1
 [[ $FILE ]] || error "--file required" 1
 
-# Directory mode: --file is a directory; upload each regular file under
-# it one at a time, re-exec'ing this script per file with the relative
-# path passed in --name (which is what gets base64'd into
-# Upload-Metadata.filename). The base-path stays fixed; the source
-# directory's basename becomes the first path segment of every name so
-# the directory itself materializes at the destination (instead of
-# its contents being splayed into the upload root).
+SUMALGO=${SUMALGO:-sha1}
+[[ $SUMALGO == "sha"* ]] || error "--algo '$SUMALGO' not supported" 1
+
+BASEPATH=${BASEPATH:-/files/}
+
+# Per-file upload body. Reads HOST, BASEPATH, CREDS/HAS_AUTH, FORCE,
+# LOCATE, SUMALGO, CURLARGS, DEBUG, NOCOLOR, NOSPIN, and the various
+# helper functions from the enclosing script. Writes its outcome via
+# the EXIT trap; for dir-mode this function is invoked in a subshell
+# per file so the trap fires (and reports / cleans up) once per file.
+upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
+{
+  FILE=$1
+  NAME=$2
+
+  [[ -f $FILE ]] || error "--file '$FILE' doesn't exist" 1
+  SIZE=$(fsize "$FILE")
+  MTIME=$(fmtime "$FILE")
+  HEADER=$(mktemp -t tus.XXXXXXXXXX)
+
+  # File checksum: skip rehashing if we have it cached for this
+  # (path, mtime, algo) tuple.
+  KEY=$(cache-checksum-get "$FILE:$MTIME" "$SUMALGO")
+  if [[ -z "$KEY" ]]; then
+    [[ $DEBUG ]] && debug "> checksum $SUMALGO $FILE"
+    spinner
+    KEY=$(hash_file_hex "$SUMALGO" "$FILE")
+    no-spinner
+    cache-checksum-set "$FILE:$MTIME" "$SUMALGO" "$KEY"
+  fi
+
+  # Mix the destination name into the Upload-Key so two distinct files
+  # with identical bytes at different upload paths don't collide on a
+  # content-deduping server. Re-uploading the same file at the same
+  # path still keys identically (resume works).
+  UPLOAD_KEY=$(printf '%s:%s' "$KEY" "$NAME" | hash_stdin_hex "$SUMALGO")
+
+  [[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nUPLOAD_KEY: $UPLOAD_KEY"
+
+  TUSURL=$(cache-loc-get "$HOST$BASEPATH" "$UPLOAD_KEY")
+  [[ $FORCE ]] && TUSURL=""
+
+  if [[ $LOCATE ]]; then
+    info "URL: $TUSURL"
+    [[ -n "$TUSURL" ]] && exit 0 || exit 1
+  fi
+
+  # Probe the cached URL. A 404/410 just means the server forgot it —
+  # fall through to a fresh POST. `|| true` keeps `set -e` from
+  # aborting the script silently on a non-2xx HEAD return.
+  [[ -n "$TUSURL" ]] && { request --head "$TUSURL" || true; }
+
+  FILEPART=$FILE
+  if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
+    OFFSET=$(header "Upload-Offset") LEFTOVER=$((SIZE - OFFSET))
+    [[ $LEFTOVER -eq 0 ]] && SKIPPED=1 && exit 0
+    if [[ $OFFSET -gt 0 ]]; then
+      PCT=$(( OFFSET * 100 / SIZE ))
+      info "↻ Resuming at byte $OFFSET / $SIZE (${PCT}%)"
+      [[ $DEBUG ]] && debug "> filepart $OFFSET $LEFTOVER $FILE"
+      spinner && FILEPART=$(filepart "$OFFSET" "$LEFTOVER" "$FILE") && no-spinner
+    fi
+  else
+    OFFSET=0 LEFTOVER=$SIZE
+    META="filename $(printf %s "$NAME" | b64)"
+    [[ $HAS_AUTH ]] && META="$META,user $(printf %s "$USER" | b64)"
+    # No Upload-Checksum on the POST: the create request has no body.
+    request \
+      -H "Upload-Length: $SIZE" \
+      -H "Upload-Key: $UPLOAD_KEY" \
+      -H "Upload-Metadata: $META" \
+      -X POST "$HOST$BASEPATH"
+
+    TUSURL=$(header "Location")
+    [[ $TUSURL ]] && cache-loc-set "$HOST$BASEPATH" "$UPLOAD_KEY" "$TUSURL"
+
+    # 0-byte file: POST already finalized the upload. Don't send an
+    # empty PATCH — some servers reject it with 404.
+    if [[ $SIZE -eq 0 ]]; then
+      OFFSET=0
+      exit 0
+    fi
+  fi
+
+  # PATCH. `--upload-file` already sets Content-Length; an explicit
+  # `Transfer-Encoding: chunked` here is invalid in HTTP/2 (curl emits
+  # chunk-framed bytes inside the H2 body, tripping LB 400s).
+  #
+  # Per the TUS spec Upload-Checksum is for the *current request
+  # body*, so we digest FILEPART (the partial slice on resume), not
+  # the whole file. Skip if openssl isn't available.
+  PATCH_ARGS=(
+    -H "Content-Type: application/offset+octet-stream"
+    -H "Content-Length: $LEFTOVER"
+    -H "Upload-Offset: $OFFSET"
+  )
+  PATCH_SUM=$(body-checksum-b64 "$SUMALGO" "$FILEPART")
+  [[ -n "$PATCH_SUM" ]] && PATCH_ARGS+=(-H "Upload-Checksum: $SUMALGO $PATCH_SUM")
+  PATCH_ARGS+=(--upload-file "$FILEPART" --request PATCH "$TUSURL")
+  request "${PATCH_ARGS[@]}" || error "Request failed" 1
+
+  # tusd returns the final Upload-Offset in the PATCH 204 response.
+  PATCH_OFFSET=$(header "Upload-Offset")
+  if [[ "$PATCH_OFFSET" == "$SIZE" ]]; then
+    OFFSET=$PATCH_OFFSET
+    exit 0
+  fi
+
+  # Fallback: poll HEAD up to 30 iterations for servers that respond
+  # before committing.
+  HEADER0=$HEADER; HEADER=$(mktemp -t tus.XXXXXXXXXX)
+  for _ in $(seq 1 30); do
+    request --head "$TUSURL" > /dev/null || true
+    POLL_OFFSET=$(header "Upload-Offset")
+    if [[ "$POLL_OFFSET" == "$SIZE" ]]; then
+      OFFSET=$POLL_OFFSET
+      exit 0
+    fi
+    sleep 2
+  done
+  error "Upload did not finalize after polling" 1
+}
+
+trap on-exit EXIT
+
+# Directory mode: walk the tree and call upload_one per file in a
+# subshell so each file's trap fires independently (per-file success
+# message, per-file cleanup) and a failed upload doesn't abort the
+# batch. The source directory's basename becomes the first path
+# segment of every Upload-Metadata.filename so the directory itself
+# materializes at the destination. CURLARGS, env-creds, and every
+# other global are inherited by the subshell — no argv reconstruction
+# needed.
 if [[ $DIRMODE ]]; then
   ROOT=$(realpath "$FILE") || error "--file '$FILE' not found" 1
   [[ -d "$ROOT" ]] || error "--file must be a directory when -d/--dir is given" 1
   ROOT="${ROOT%/}"
   ROOT_NAME=$(basename "$ROOT")
 
-  total=0 idx=0 fails=0
-  while IFS= read -r -d '' f; do total=$((total+1)); done \
-    < <(find "$ROOT" -type f -print0)
-  [[ $total -eq 0 ]] && error "no files under '$ROOT'" 1
+  # Single-pass: snapshot the file list into a manifest, count from
+  # it, iterate from it. Saves walking the tree twice.
+  ensure-tusdir
+  MANIFEST=$(mktemp "$TUSDIR/manifest.XXXXXXXX")
+  find "$ROOT" -type f -print0 | LC_ALL=C sort -z > "$MANIFEST"
+  total=$(tr -dc '\0' < "$MANIFEST" | wc -c | tr -d ' ')
+  [[ $total -eq 0 ]] && { rm -f -- "$MANIFEST"; error "no files under '$ROOT'" 1; }
   info "Uploading $total file(s) from $ROOT (as $ROOT_NAME/...)"
 
+  idx=0 fails=0
   while IFS= read -r -d '' f; do
     idx=$((idx+1))
     rel="$ROOT_NAME/${f#$ROOT/}"
     info "[$idx/$total] $rel"
-    bash "$FULL" \
-      ${NOCOLOR:+--no-color} \
-      ${NOSPIN:+--no-spin} \
-      ${FORCE:+--force} \
-      ${SUMALGO:+--algo "$SUMALGO"} \
-      ${CREDS:+--creds "$CREDS"} \
-      ${BASEPATH:+--base-path "$BASEPATH"} \
-      --host "$HOST" \
-      --file "$f" \
-      --name "$rel" \
-    || fails=$((fails+1))
-  done < <(find "$ROOT" -type f -print0 | LC_ALL=C sort -z)
+    ( upload_one "$f" "$rel" ) || fails=$((fails+1))
+  done < "$MANIFEST"
+  rm -f -- "$MANIFEST"
 
   [[ $fails -gt 0 ]] && error "$fails file(s) failed to upload" 1
   ok "✔ $total file(s) uploaded from $ROOT"
   exit 0
 fi
 
-trap on-exit EXIT
-
-[[ -f $FILE ]] || error "--file doesn't exist" 1
-
-SUMALGO=${SUMALGO:-sha1}
-[[ $SUMALGO == "sha"* ]] || error "--algo '$SUMALGO' not supported" 1
-
-FILE=`realpath "$FILE"`  NAME=${NAME_OVERRIDE:-`basename "$FILE"`}  SIZE=`fsize "$FILE"`  MTIME=`fmtime "$FILE"`
-HEADER=`mktemp -t tus.XXXXXXXXXX`
-
-# calc &/or cache key and checksum
-KEY=$(cache-checksum-get "$FILE:$MTIME" "$SUMALGO")
-if [[ -z "$KEY" ]]; then
-  [[ $DEBUG ]] && debug "> checksum $SUMALGO $FILE"
-  spinner
-  read -r KEY _ <<< "$(checksum "$SUMALGO" "$FILE")"
-  no-spinner
-  cache-checksum-set "$FILE:$MTIME" "$SUMALGO" "$KEY"
-fi
-
-# The Upload-Key header we send (and the URL we cache against) must be
-# unique per (content, destination). If we used the bare content
-# digest, two distinct files with identical bytes — common with empty
-# placeholders, stub files, or fixture data — would collide: a
-# content-deduping server may hand the second POST back an
-# already-finalized upload id, causing the follow-up PATCH to fail
-# 404. Mix the destination name in so identical content at different
-# upload paths stays distinct, while a re-run of the same file at the
-# same path still keys identically and resumes.
-UPLOAD_KEY=$(printf '%s:%s' "$KEY" "$NAME" \
-  | (command -v "${SUMALGO}sum" >/dev/null 2>&1 && "${SUMALGO}sum" || shasum -a "${SUMALGO#sha}") \
-  | awk '{print $1}')
-
-[[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nUPLOAD_KEY: $UPLOAD_KEY"
-
-# head request
-BASEPATH=${BASEPATH:-/files/}
-TUSURL=$(locate "$HOST" "$BASEPATH" "$UPLOAD_KEY")
-# --force ignores any cached upload URL so we always start a fresh POST.
-[[ $FORCE ]] && TUSURL=""
-[[ $LOCATE ]] && info "URL: $TUSURL" && [[ -n "$TUSURL" ]]; [[ $LOCATE ]] && exit $?
-# Probe the cached URL with a HEAD. A non-2xx here just means the
-# server forgot the upload (tusd's retention expired, host cleaned up,
-# etc.) — fall through to a fresh POST. `|| true` keeps `set -e` from
-# aborting the script silently on the HEAD's non-zero return.
-[[ -n "$TUSURL" ]] && { request --head "$TUSURL" || true; }
-
-FILEPART=$FILE
-if [[ -n "$TUSURL" ]] && [[ $ISOK -eq 1 ]]; then
-  OFFSET=$(header "Upload-Offset") LEFTOVER=$((SIZE - OFFSET))
-  # Server reports this upload is already complete — short-circuit and
-  # tell the user it was a no-op (re-run with --force to upload again).
-  [[ $LEFTOVER -eq 0 ]] && SKIPPED=1 && exit 0
-  if [[ $OFFSET -gt 0 ]]; then
-    PCT=$(( OFFSET * 100 / SIZE ))
-    info "↻ Resuming at byte $OFFSET / $SIZE (${PCT}%)"
-    [[ $DEBUG ]] && debug "> filepart $OFFSET $LEFTOVER $FILE"
-    spinner && FILEPART=`filepart $OFFSET $LEFTOVER $FILE` && no-spinner
-  fi
-
-# create request
-else
-  OFFSET=0 LEFTOVER=$SIZE
-  META="filename $(printf %s "$NAME" | b64)"
-  [[ $HAS_AUTH ]] && META="$META,user $(printf %s "$USER" | b64)"
-  # No Upload-Checksum on the POST: the create request has no body.
-  request \
-    -H "Upload-Length: $SIZE" \
-    -H "Upload-Key: $UPLOAD_KEY" \
-    -H "Upload-Metadata: $META" \
-    -X POST "$HOST$BASEPATH"
-
-  # save location config
-  TUSURL=$(header "Location")
-  [[ $TUSURL ]] && cache-loc-set "$HOST$BASEPATH" "$UPLOAD_KEY" "$TUSURL"
-
-  # 0-byte file: the POST already created the upload at its terminal
-  # state (Upload-Length: 0). Sending a follow-up PATCH with an empty
-  # body is wasteful and some servers reject it with 404 ("upload not
-  # found") because there's nothing left to write. Skip the PATCH.
-  if [[ $SIZE -eq 0 ]]; then
-    OFFSET=0
-    exit 0
-  fi
-fi
-
-# curl's built-in progress meter does the job for the PATCH (visible in
-# request() unless -S/--no-spin or DEBUG=1 is set), so don't start the
-# bash spinner here.
-
-# patch request — `--upload-file` already sets Content-Length from the
-# file size; an explicit `Transfer-Encoding: chunked` here is invalid
-# over HTTP/2 (e.g. behind an AWS ELB) and makes curl send chunk-framed
-# bytes inside the H2 body, tripping a 400 at the load balancer.
-#
-# Per the TUS spec, Upload-Checksum is for the *current request body*.
-# That means we have to digest FILEPART (the partial slice on resume),
-# not the whole file. Skip the header if openssl isn't available — the
-# spec makes Upload-Checksum optional.
-PATCH_ARGS=(
-  -H "Content-Type: application/offset+octet-stream"
-  -H "Content-Length: $LEFTOVER"
-  -H "Upload-Offset: $OFFSET"
-)
-PATCH_SUM=$(body-checksum-b64 "$SUMALGO" "$FILEPART")
-[[ -n "$PATCH_SUM" ]] && PATCH_ARGS+=(-H "Upload-Checksum: $SUMALGO $PATCH_SUM")
-PATCH_ARGS+=(--upload-file "$FILEPART" --request PATCH "$TUSURL")
-request "${PATCH_ARGS[@]}" || error "Request failed" 1
-
-# tusd (and any spec-compliant server) returns the final Upload-Offset
-# in the PATCH 204 response. If we're already at SIZE, finish up; the
-# trap will report success from $OFFSET.
-PATCH_OFFSET=$(header "Upload-Offset")
-if [[ "$PATCH_OFFSET" == "$SIZE" ]]; then
-  OFFSET=$PATCH_OFFSET
-  exit 0
-fi
-
-# Fallback: some servers reply before fully committing. Poll HEAD until
-# the upload settles or we give up. `|| true` keeps `set -e` from
-# aborting the script silently when the server returns a non-2xx HEAD
-# (e.g. Astera's gateway returns 404 once an upload is finalized).
-HEADER0=$HEADER; HEADER=`mktemp -t tus.XXXXXXXXXX`
-for _ in $(seq 1 30); do
-  request --head "$TUSURL" > /dev/null || true
-  POLL_OFFSET=$(header "Upload-Offset")
-  if [[ "$POLL_OFFSET" == "$SIZE" ]]; then
-    OFFSET=$POLL_OFFSET
-    exit 0
-  fi
-  sleep 2
-done
-error "Upload did not finalize after polling" 1
+upload_one "$FILE" "${NAME_OVERRIDE:-$(basename "$FILE")}"
