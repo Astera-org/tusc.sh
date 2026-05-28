@@ -2,9 +2,13 @@ name: Test
 
 on:
   push:
-    branches:
-      - main
   pull_request:
+  workflow_dispatch:
+
+# Cancel in-flight runs for the same branch/PR when a new commit lands.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
