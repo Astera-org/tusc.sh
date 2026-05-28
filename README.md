@@ -124,9 +124,16 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
        --version   Print the current tusc version.
 
   Environment:
-    DEBUG=1        Verbose curl + show debug headers on stderr.
+    DEBUG=1        Show the script's request trace on stderr. Also enables
+                   curl -v unless basic-auth creds are in use (-v leaks the
+                   Authorization header).
+    TUSC_DEBUG_UNSAFE=1  Re-enable curl -v when DEBUG=1 + creds. Use only for
+                   debugging against trusted endpoints — exposes Authorization.
     TUSDIR         Cache dir for resume state and file checksums.
                    (Default: $TMPDIR/tusc.<uid>/. Delete to force a fresh upload.)
+    TUSC_NOCACHE=1 Always re-hash the file; ignore the checksum cache.
+    TUSC_USER      Basic-auth username (alternative to --creds file).
+    TUSC_PASS      Basic-auth password (paired with TUSC_USER).
 
   Examples:
     tusc.sh --help                           # shows this help

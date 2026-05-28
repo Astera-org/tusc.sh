@@ -92,6 +92,29 @@ sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'
+  else shasum -a 256 | awk '{print $1}'; fi
+}
+sha1_stdin() {
+  if command -v sha1sum >/dev/null 2>&1; then sha1sum | awk '{print $1}'
+  else shasum -a 1 | awk '{print $1}'; fi
+}
+
+# Compute the script's UPLOAD_KEY (sha256 of content:host:basepath:name).
+upload_key_for() { # $1=file, $2=host (with port), $3=basepath, $4=name
+  local key; key=$(sha256 "$1")
+  printf '%s:%s:%s:%s' "$key" "$2" "$3" "$4" | sha256_stdin
+}
+
+# Seed tusc's loc cache with a known URL for (file, host, basepath, name).
+# Writes to: <tdir>/loc.<upload-key>.<sha1-of-host+basepath>
+seed_loc_cache() { # $1=tdir, $2=file, $3=host, $4=basepath, $5=name, $6=url
+  local upload_key hostsha
+  upload_key=$(upload_key_for "$2" "$3" "$4" "$5")
+  hostsha=$(printf '%s' "$3$4" | sha1_stdin)
+  printf %s "$6" > "$1/loc.$upload_key.$hostsha"
+}
 
 # Run tusc.sh from the repo root. Per-test TUSDIR isolates resume state.
 tusc() { ( cd "$REPO_ROOT" && bash ./tusc.sh "$@" ); }
@@ -266,19 +289,7 @@ test_resume_from_readonly_source_dir() {
     -H "Upload-Checksum: sha256 $sum" \
     --data-binary "@$WORK_DIR/ro-chunk" -X PATCH "$loc" >/dev/null
 
-  # UPLOAD_KEY = sha256("<content>:<host>:<basepath>:<name>") (must
-  # match the script's recipe in upload_one) so the seeded loc.* file
-  # is actually found and the script HEAD/resumes the partial upload
-  # instead of starting a fresh one.
-  local key; key=$(sha256 "$rodir/big.bin")
-  local upload_key
-  upload_key=$(printf '%s:%s:%s:%s' "$key" "$TUSD_HOST:$TUSD_PORT" "/files/" "big.bin" \
-    | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
-  local hostsha
-  hostsha=$(printf %s "$TUSD_HOST:$TUSD_PORT/files/" \
-    | (command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum -a 1) \
-    | awk '{print $1}')
-  printf %s "$loc" > "$tdir/loc.$upload_key.$hostsha"
+  seed_loc_cache "$tdir" "$rodir/big.bin" "$TUSD_HOST:$TUSD_PORT" "/files/" "big.bin" "$loc"
 
   local out rc
   out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$rodir/big.bin" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
@@ -504,12 +515,10 @@ test_upload_key_includes_destination() {
   # changes.
   local f="$WORK_DIR/bp.bin"
   printf 'shared bytes' > "$f"
-  local key; key=$(sha256 "$f")
-  local SUM='(command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk "{print \$1}"'
   local same other_host other_base
-  same=$(printf '%s:%s:%s:%s' "$key" "h1" "/files/" "bp.bin" | eval "$SUM")
-  other_host=$(printf '%s:%s:%s:%s' "$key" "h2" "/files/" "bp.bin" | eval "$SUM")
-  other_base=$(printf '%s:%s:%s:%s' "$key" "h1" "/other/" "bp.bin" | eval "$SUM")
+  same=$(upload_key_for       "$f" "h1" "/files/" "bp.bin")
+  other_host=$(upload_key_for "$f" "h2" "/files/" "bp.bin")
+  other_base=$(upload_key_for "$f" "h1" "/other/" "bp.bin")
   [[ "$same" != "$other_host" ]] || { fail "UPLOAD_KEY collided across hosts"; return 1; }
   [[ "$same" != "$other_base" ]] || { fail "UPLOAD_KEY collided across base-paths"; return 1; }
 }
@@ -556,6 +565,56 @@ test_dir_forwards_curl_passthrough() {
   patch_seen=$(grep -c -- "X-Tusc-Passthrough.*--request PATCH" <<< "$out")
   [[ "$post_seen" -ge 1 ]] || { fail "passthrough header missing from POST in: $out"; return 1; }
   [[ "$patch_seen" -ge 1 ]] || { fail "passthrough header missing from PATCH in: $out"; return 1; }
+}
+
+test_path_relative_location_is_resolved() {
+  # Per RFC 3986 a path-relative Location ("uploads/123") resolves
+  # against the *directory* of the POST URL — not by string-prefixing
+  # the host. Tests the script handles the no-leading-slash form.
+  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
+  local port=$((40000 + RANDOM % 10000))
+  cat > "$WORK_DIR/pathrel-stub.py" <<PY
+import http.server, socketserver, sys
+PORT = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        # No leading slash, no scheme. Must be resolved against
+        # http://host:port/files/ (the POST target).
+        self.send_response(201)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Location", "uploads/REL-ID")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def do_PATCH(self):
+        body_len = int(self.headers.get("Content-Length", "0"))
+        if body_len: self.rfile.read(body_len)
+        self.send_response(204)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Upload-Offset", str(body_len))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a, **k): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
+    s.serve_forever()
+PY
+  python3 "$WORK_DIR/pathrel-stub.py" "$port" >/dev/null 2>&1 &
+  STUB_PID=$!
+  for _ in $(seq 1 50); do
+    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
+    sleep 0.05
+  done
+
+  local f="$WORK_DIR/pathrel.bin"; local tdir="$WORK_DIR/pathrel-cache"
+  printf 'path-relative-loc' > "$f"
+  local rc
+  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C >/dev/null 2>&1 && rc=0 || rc=$?
+  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+
+  [[ $rc -eq 0 ]] || { fail "upload with path-relative Location failed: rc=$rc"; return 1; }
+  local cached; cached=$(cat "$tdir"/loc.* 2>/dev/null | head -1)
+  [[ "$cached" == "http://127.0.0.1:$port/files/uploads/REL-ID" ]] \
+    || { fail "expected http://127.0.0.1:$port/files/uploads/REL-ID; got: $cached"; return 1; }
 }
 
 test_relative_location_is_resolved() {
@@ -795,15 +854,7 @@ test_resume_announces_offset() {
     -H "Upload-Offset: 0" \
     -H "Upload-Checksum: sha256 $sum" \
     --data-binary "@$WORK_DIR/resume-chunk" -X PATCH "$loc" >/dev/null
-  # Seed the cache. UPLOAD_KEY = SUMALGO("<content>:<host>:<basepath>:<name>").
-  local key; key=$(sha256 "$f")
-  local upload_key
-  upload_key=$(printf '%s:%s:%s:%s' "$key" "$TUSD_HOST:$TUSD_PORT" "/files/" "resume.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
-  local hostsha
-  hostsha=$(printf %s "$TUSD_HOST:$TUSD_PORT/files/" \
-    | (command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum -a 1) \
-    | awk '{print $1}')
-  printf %s "$loc" > "$tdir/loc.$upload_key.$hostsha"
+  seed_loc_cache "$tdir" "$f" "$TUSD_HOST:$TUSD_PORT" "/files/" "resume.bin" "$loc"
 
   local out
   out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C)
@@ -872,15 +923,8 @@ test_head_5xx_surfaces_error() {
   start_stub_server "$port"
   local tdir="$WORK_DIR/head500-cache"; mkdir -p "$tdir"
   printf payload > "$WORK_DIR/head500.bin"
-  # Seed cache: UPLOAD_KEY = sha256("<content>:<host>:<basepath>:<name>").
-  local key; key=$(sha256 "$WORK_DIR/head500.bin")
-  local upload_key
-  upload_key=$(printf '%s:%s:%s:%s' "$key" "127.0.0.1:$port" "/files/" "head500.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
-  local hostsha
-  hostsha=$(printf %s "127.0.0.1:$port/files/" \
-    | (command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum -a 1) \
-    | awk '{print $1}')
-  printf %s "http://127.0.0.1:$port/files/seeded" > "$tdir/loc.$upload_key.$hostsha"
+  seed_loc_cache "$tdir" "$WORK_DIR/head500.bin" "127.0.0.1:$port" "/files/" "head500.bin" \
+    "http://127.0.0.1:$port/files/seeded"
 
   local out rc
   out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$WORK_DIR/head500.bin" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
@@ -930,7 +974,8 @@ run "--locate requires --host"                             test_locate_requires_
 run "UPLOAD_KEY differs across host and base-path"          test_upload_key_includes_destination
 run "-d manifest is cleaned up even on interrupt"          test_dir_manifest_cleaned_on_interrupt
 run "invalid --algo is rejected by whitelist"              test_invalid_algo_rejected
-run "relative Location is resolved against host"           test_relative_location_is_resolved
+run "absolute-path Location is resolved against host"      test_relative_location_is_resolved
+run "path-relative Location resolves against POST URL dir" test_path_relative_location_is_resolved
 run "POST that returns no Location errors out"             test_post_with_no_location_errors
 run "DEBUG drops curl -v when auth creds are in use"       test_debug_drops_curl_v_when_auth_present
 run "header() returns final response Location after redirect" test_header_returns_final_response_after_redirect

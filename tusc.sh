@@ -94,6 +94,50 @@ body-checksum-b64() # $1 = algo, $2 = file (the actual PATCH body)
   openssl dgst "-$1" -binary "$2" 2>/dev/null | base64 | tr -d '\n'
 }
 
+# Resolve a TUS Location header against the POST URL per RFC 3986:
+#   absolute (http://...) — return as-is
+#   protocol-relative (//host/p) — prefix scheme from base
+#   absolute-path (/p) — combine with scheme+authority of base
+#   path-relative (p) — combine with base's directory (up to the
+#                       last "/", inclusive)
+# Note: redirect chains are not tracked here — the base is the
+# original POST URL ($HOST$BASEPATH). Servers should prefer absolute
+# Location values; relative resolution after a redirect is a known
+# limitation of this approach.
+resolve_url() # $1 = base URL (POST target), $2 = Location reference
+{
+  local base=$1 ref=$2
+  case "$ref" in
+    http://*|https://*) printf '%s\n' "$ref"; return ;;
+  esac
+  # Ensure base has a scheme so the regex below can pull it.
+  case "$base" in
+    http://*|https://*) ;;
+    *) base="http://$base" ;;
+  esac
+  local scheme="http:"
+  [[ "$base" =~ ^(https?): ]] && scheme="${BASH_REMATCH[1]}:"
+  case "$ref" in
+    //*) printf '%s%s\n' "$scheme" "$ref"; return ;;
+  esac
+  local sch_auth=""
+  [[ "$base" =~ ^(https?://[^/]+) ]] && sch_auth="${BASH_REMATCH[1]}"
+  case "$ref" in
+    /*) printf '%s%s\n' "$sch_auth" "$ref"; return ;;
+  esac
+  # Path-relative: combine with base's directory portion.
+  local base_path="${base#${sch_auth}}"
+  # Strip query/fragment if any so base_path is just the path.
+  base_path="${base_path%%[?#]*}"
+  # Keep up to the last "/" (inclusive). If base has no "/" after
+  # the authority, treat the path as "/".
+  case "$base_path" in
+    */*) base_path="${base_path%/*}/" ;;
+    *)   base_path="/" ;;
+  esac
+  printf '%s%s%s\n' "$sch_auth" "$base_path" "$ref"
+}
+
 # message helpers
 # Arguments: $1=text, $2=color, $3=style, $4=exit-code (optional),
 # $5=target fd (1=stdout default, 2=stderr).
@@ -173,7 +217,11 @@ usage()
     $(info "   --version")   $(comment "Print the current tusc version.")
 
   $(ok Environment:)
-    $(info "DEBUG=1")        $(comment "Verbose curl + show debug headers on stderr.")
+    $(info "DEBUG=1")        $(comment "Show the script's request trace on stderr. Also enables")
+                   $(comment "curl -v unless basic-auth creds are in use (-v leaks the")
+                   $(comment "Authorization header).")
+    $(info "TUSC_DEBUG_UNSAFE=1") $(comment "Re-enable curl -v when DEBUG=1 + creds. Use only for")
+                   $(comment "debugging against trusted endpoints — exposes Authorization.")
     $(info "TUSDIR")         $(comment "Cache dir for resume state and file checksums.")
                    $(comment "(Default: \$TMPDIR/tusc.<uid>/. Delete to force a fresh upload.)")
     $(info "TUSC_NOCACHE=1") $(comment "Always re-hash the file; ignore the checksum cache.")
@@ -513,6 +561,10 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
 {
   FILE=$1
   NAME=$2
+  # When dir mode invokes us in a subshell we inherit MANIFEST_TMP
+  # from the parent. The subshell's EXIT trap would then rm the
+  # parent's manifest mid-loop — clear it so only the parent cleans.
+  MANIFEST_TMP=""
 
   [[ -f $FILE ]] || error "--file '$FILE' doesn't exist" 1
   SIZE=$(fsize "$FILE")
@@ -598,19 +650,7 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
 
     TUSURL=$(header "Location")
     [[ -n "$TUSURL" ]] || error "POST returned 2xx but no Location header" 1
-    # The TUS spec lets the server return Location either absolute or
-    # as a path. Resolve a path-relative Location against the
-    # scheme+authority of HOST so PATCH (and --locate) get a valid
-    # absolute URL.
-    if [[ "$TUSURL" != http://* && "$TUSURL" != https://* ]]; then
-      local base
-      if [[ "$HOST" =~ ^(https?://[^/]+) ]]; then
-        base="${BASH_REMATCH[1]}"
-      else
-        base="http://${HOST%%/*}"
-      fi
-      TUSURL="$base$TUSURL"
-    fi
+    TUSURL=$(resolve_url "$HOST$BASEPATH" "$TUSURL")
     cache-loc-set "$HOST$BASEPATH" "$UPLOAD_KEY" "$TUSURL"
 
     # 0-byte file: POST already finalized the upload. Don't send an
