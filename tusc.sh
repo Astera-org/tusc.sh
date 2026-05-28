@@ -316,12 +316,16 @@ request()
   # Scan for the request shape so we can adjust verbosity. Look at the
   # CLI tokens we'll pass to curl — both --head and PATCH appear as
   # standalone args (--head is a single flag; PATCH follows --request).
-  local arg is_head=0 is_patch=0
+  # Also stash the caller's last argument as the request target — by
+  # convention that's the URL — so error reporting can still name it
+  # if the internal `-w` marker is the literal last element of cmd[].
+  local arg is_head=0 is_patch=0 target_url=""
   for arg in "$@"; do
     case "$arg" in
       --head) is_head=1 ;;
       PATCH)  is_patch=1 ;;
     esac
+    target_url=$arg
   done
 
   # Build the curl argv array.
@@ -407,8 +411,10 @@ request()
   fi
 
   if [[ $ISOK -eq 0 && $suppress -eq 0 ]]; then
-    # Last arg in the curl argv is the URL we hit.
-    local target=${cmd[${#cmd[@]}-1]}
+    # Prefer curl's post-redirect URL; fall back to the caller's last
+    # positional arg (the URL by convention). Don't use cmd[-1] —
+    # that's our internal `-w` value now that it appends last.
+    local target="${EFFECTIVE_URL:-$target_url}"
     local msg="✖ Request failed: HTTP ${STATUS:-?} on $target"
     [[ -n "$BODY" ]] && msg="$msg"$'\n'"$BODY"
     error "$msg" 1
