@@ -558,6 +558,120 @@ test_dir_forwards_curl_passthrough() {
   [[ "$patch_seen" -ge 1 ]] || { fail "passthrough header missing from PATCH in: $out"; return 1; }
 }
 
+test_relative_location_is_resolved() {
+  # Per the TUS spec the server may return Location relative to HOST.
+  # The script must resolve "/path/<id>" against the host's
+  # scheme+authority before caching / PATCHing.
+  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
+  local port=$((40000 + RANDOM % 10000))
+  cat > "$WORK_DIR/rel-stub.py" <<PY
+import http.server, socketserver, sys
+PORT = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        # Spec-allowed relative Location.
+        self.send_response(201)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Location", "/files/REL-UPLOAD-ID")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def do_PATCH(self):
+        body_len = int(self.headers.get("Content-Length", "0"))
+        if body_len: self.rfile.read(body_len)
+        self.send_response(204)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Upload-Offset", str(body_len))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a, **k): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
+    s.serve_forever()
+PY
+  python3 "$WORK_DIR/rel-stub.py" "$port" >/dev/null 2>&1 &
+  STUB_PID=$!
+  for _ in $(seq 1 50); do
+    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
+    sleep 0.05
+  done
+
+  local f="$WORK_DIR/rel.bin"; local tdir="$WORK_DIR/rel-cache"
+  printf 'relative-loc' > "$f"
+  local out
+  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+
+  [[ $rc -eq 0 ]] || { fail "upload against relative-Location server failed: $out"; return 1; }
+  local cached; cached=$(cat "$tdir"/loc.* 2>/dev/null | head -1)
+  [[ "$cached" == "http://127.0.0.1:$port/files/REL-UPLOAD-ID" ]] \
+    || { fail "expected absolute URL in cache; got: $cached"; return 1; }
+}
+
+test_post_with_no_location_errors() {
+  # A 2xx POST that omits Location is unusable — no URL to PATCH or
+  # cache. Must fail loudly instead of "succeeding" with an empty URL.
+  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
+  local port=$((40000 + RANDOM % 10000))
+  cat > "$WORK_DIR/noloc-stub.py" <<PY
+import http.server, socketserver, sys
+PORT = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        # 201 but no Location header.
+        self.send_response(201)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a, **k): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
+    s.serve_forever()
+PY
+  python3 "$WORK_DIR/noloc-stub.py" "$port" >/dev/null 2>&1 &
+  STUB_PID=$!
+  for _ in $(seq 1 50); do
+    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
+    sleep 0.05
+  done
+
+  local f="$WORK_DIR/noloc.bin"; local tdir="$WORK_DIR/noloc-cache"
+  printf 'no-loc' > "$f"
+  local out rc
+  out=$(TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
+  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+
+  [[ $rc -ne 0 ]] || { fail "expected non-zero exit when POST returns no Location; got 0, out=$out"; return 1; }
+  grep -q "no Location header" <<< "$out" \
+    || { fail "expected explicit no-Location-header error; got: $out"; return 1; }
+}
+
+test_debug_drops_curl_v_when_auth_present() {
+  # `curl -v` prints the Authorization header. Under DEBUG=1 with
+  # creds the script must omit -v unless TUSC_DEBUG_UNSAFE=1 is also
+  # set. Detect via the absence of "* Connected to" (a curl -v line)
+  # in the transcript when creds are present.
+  local f="$WORK_DIR/vauth.bin"; local tdir="$WORK_DIR/vauth-cache"
+  printf 'hi' > "$f"
+  local out
+  out=$(TUSDIR="$tdir" TUSC_USER=alice TUSC_PASS=secret DEBUG=1 \
+        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+    || { fail "auth upload failed: $out"; return 1; }
+  # No curl-verbose lines (those start with "* ", e.g. "* Connected to ...").
+  if grep -q "^\* " <<< "$out"; then
+    fail "curl -v transcript present in DEBUG output despite HAS_AUTH; out: $out"
+    return 1
+  fi
+  # The synthetic '> curl ...' line is still there (our own argv trace).
+  grep -q "^> curl " <<< "$out" \
+    || { fail "expected synthetic '> curl' debug line; got: $out"; return 1; }
+  # TUSC_DEBUG_UNSAFE=1 must re-enable -v.
+  out=$(TUSDIR="${tdir}2" TUSC_USER=alice TUSC_PASS=secret TUSC_DEBUG_UNSAFE=1 DEBUG=1 \
+        tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
+    || { fail "TUSC_DEBUG_UNSAFE upload failed: $out"; return 1; }
+  grep -q "^\* " <<< "$out" \
+    || { fail "TUSC_DEBUG_UNSAFE=1 should re-enable curl -v; got: $out"; return 1; }
+}
+
 test_header_returns_final_response_after_redirect() {
   # When the server 302s the POST to a different URL that then returns
   # the real Location, header() must report the *final* response's
@@ -816,6 +930,9 @@ run "--locate requires --host"                             test_locate_requires_
 run "UPLOAD_KEY differs across host and base-path"          test_upload_key_includes_destination
 run "-d manifest is cleaned up even on interrupt"          test_dir_manifest_cleaned_on_interrupt
 run "invalid --algo is rejected by whitelist"              test_invalid_algo_rejected
+run "relative Location is resolved against host"           test_relative_location_is_resolved
+run "POST that returns no Location errors out"             test_post_with_no_location_errors
+run "DEBUG drops curl -v when auth creds are in use"       test_debug_drops_curl_v_when_auth_present
 run "header() returns final response Location after redirect" test_header_returns_final_response_after_redirect
 run "DEBUG masks passwords with shell metacharacters"      test_debug_masks_password_with_metacharacters
 run "TUSC_USER/TUSC_PASS env creds are honored" test_env_var_credentials

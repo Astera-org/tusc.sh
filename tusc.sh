@@ -122,7 +122,20 @@ update()
   [[ "v$NEWVER" == "$(version)" ]] && ok "Already latest version" 0
 
   info "Updating $TUSC ..."
-  curl -fsSLo "$FULL" https://raw.githubusercontent.com/Astera-org/tusc.sh/main/tusc.sh
+  # Download to a sibling temp file, lint it, then atomic rename.
+  # Writing straight onto $FULL leaves a corrupted script behind if
+  # the curl is interrupted or the body is truncated.
+  local tmp; tmp=$(mktemp "$FULL.update.XXXXXXXX")
+  if ! curl -fsSLo "$tmp" https://raw.githubusercontent.com/Astera-org/tusc.sh/main/tusc.sh; then
+    rm -f -- "$tmp"
+    error "✖ Update download failed" 1
+  fi
+  if ! bash -n "$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"
+    error "✖ Downloaded script failed bash -n syntax check; refusing to install" 1
+  fi
+  chmod 755 "$tmp"
+  mv -f -- "$tmp" "$FULL"
   ok "  Done [${NEWVER}]"
 }
 
@@ -267,7 +280,13 @@ request()
 
   # Build the curl argv array.
   local cmd=(curl)
-  [[ $DEBUG ]] && cmd+=(-v)
+  # `curl -v` prints the request transcript including the
+  # `Authorization:` header. Skip it when basic-auth creds are in use
+  # so DEBUG traces don't leak the base64'd user:pass. Set
+  # TUSC_DEBUG_UNSAFE=1 to acknowledge the risk and re-enable -v.
+  if [[ $DEBUG ]] && { [[ -z $HAS_AUTH ]] || [[ -n "${TUSC_DEBUG_UNSAFE:-}" ]]; }; then
+    cmd+=(-v)
+  fi
   # -sS = silent + show errors. For the PATCH (the only large body
   # transfer) we drop -s so curl's progress meter writes to stderr.
   if [[ $is_patch -eq 1 && -z $NOSPIN && -z $DEBUG ]]; then
@@ -578,7 +597,21 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
       -X POST "$HOST$BASEPATH"
 
     TUSURL=$(header "Location")
-    [[ $TUSURL ]] && cache-loc-set "$HOST$BASEPATH" "$UPLOAD_KEY" "$TUSURL"
+    [[ -n "$TUSURL" ]] || error "POST returned 2xx but no Location header" 1
+    # The TUS spec lets the server return Location either absolute or
+    # as a path. Resolve a path-relative Location against the
+    # scheme+authority of HOST so PATCH (and --locate) get a valid
+    # absolute URL.
+    if [[ "$TUSURL" != http://* && "$TUSURL" != https://* ]]; then
+      local base
+      if [[ "$HOST" =~ ^(https?://[^/]+) ]]; then
+        base="${BASH_REMATCH[1]}"
+      else
+        base="http://${HOST%%/*}"
+      fi
+      TUSURL="$base$TUSURL"
+    fi
+    cache-loc-set "$HOST$BASEPATH" "$UPLOAD_KEY" "$TUSURL"
 
     # 0-byte file: POST already finalized the upload. Don't send an
     # empty PATCH — some servers reject it with 404.
