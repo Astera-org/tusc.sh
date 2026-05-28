@@ -34,8 +34,7 @@ STATUS=   # last response status code
 # (e.g. editor "save twice" within 1s, or `cp -p` preserving mtime
 # *and* size) still invalidates the cached digest.
 if stat -c %s /dev/null >/dev/null 2>&1; then
-  fsize()  { stat -c %s "$1"; }
-  fmtime() { stat -c %Y "$1"; }
+  fsize() { stat -c %s "$1"; }
   fmtime_fine() {
     # GNU stat: %y -> "YYYY-MM-DD HH:MM:SS.NNNNNNNNN ±HHMM"
     local sec frac
@@ -44,8 +43,7 @@ if stat -c %s /dev/null >/dev/null 2>&1; then
     printf '%s.%s' "$sec" "${frac:-0}"
   }
 else
-  fsize()  { stat -f %z "$1"; }
-  fmtime() { stat -f %m "$1"; }
+  fsize() { stat -f %z "$1"; }
   fmtime_fine() { stat -f %Fm "$1"; }   # BSD: "<seconds>.<nanoseconds>"
 fi
 
@@ -499,7 +497,6 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
 
   [[ -f $FILE ]] || error "--file '$FILE' doesn't exist" 1
   SIZE=$(fsize "$FILE")
-  MTIME=$(fmtime "$FILE")
   HEADER=$(mktemp -t tus.XXXXXXXXXX)
 
   # File checksum: skip rehashing if we have it cached for this
@@ -522,14 +519,12 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
     cache-checksum-set "$CKEY" "$SUMALGO" "$KEY"
   fi
 
-  # Upload-Key must be unique per (content, destination). The
-  # destination here is the *full* destination — host, base-path, and
-  # in-bucket name. Mixing only content + name would still let two
-  # uploads collide on a server that honors Upload-Key when they share
-  # the file/name pair but differ on base-path (different bucket or
-  # tenant subtree). Re-running the same upload to the same
-  # host+basepath+name still keys identically, so resume works.
-  UPLOAD_KEY=$(printf '%s:%s:%s' "$KEY" "$BASEPATH" "$NAME" | hash_stdin_hex "$SUMALGO")
+  # Upload-Key must be unique per (content, full destination). Mix in
+  # HOST, BASEPATH, and NAME so host aliases pointing at the same
+  # backend (rare but real) don't collide on servers that dedupe
+  # globally by Upload-Key. Re-running the same upload at the same
+  # full destination still keys identically, so resume works.
+  UPLOAD_KEY=$(printf '%s:%s:%s:%s' "$KEY" "$HOST" "$BASEPATH" "$NAME" | hash_stdin_hex "$SUMALGO")
 
   [[ $DEBUG ]] && info "HOST  : $HOST\nHEADER: $HEADER\nFILE  : $NAME\nSIZE  : $SIZE\nKEY   : $KEY\nUPLOAD_KEY: $UPLOAD_KEY"
 

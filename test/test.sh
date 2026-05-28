@@ -266,9 +266,14 @@ test_resume_from_readonly_source_dir() {
     -H "Upload-Checksum: sha256 $sum" \
     --data-binary "@$WORK_DIR/ro-chunk" -X PATCH "$loc" >/dev/null
 
+  # UPLOAD_KEY = sha256("<content>:<host>:<basepath>:<name>") (must
+  # match the script's recipe in upload_one) so the seeded loc.* file
+  # is actually found and the script HEAD/resumes the partial upload
+  # instead of starting a fresh one.
   local key; key=$(sha256 "$rodir/big.bin")
   local upload_key
-  upload_key=$(printf '%s:%s' "$key" "big.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
+  upload_key=$(printf '%s:%s:%s:%s' "$key" "$TUSD_HOST:$TUSD_PORT" "/files/" "big.bin" \
+    | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
   local hostsha
   hostsha=$(printf %s "$TUSD_HOST:$TUSD_PORT/files/" \
     | (command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum -a 1) \
@@ -278,10 +283,11 @@ test_resume_from_readonly_source_dir() {
   local out rc
   out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$rodir/big.bin" -a sha256 -S -C 2>&1) && rc=0 || rc=$?
   chmod 755 "$rodir"   # restore for cleanup
-  [[ $rc -eq 0 ]] || fail "expected resume to succeed on read-only source dir; rc=$rc out=$out"
-  grep -q "Uploaded successfully" <<< "$out" || fail "no success message: $out"
-  # And no .part should be created next to the source.
-  [[ ! -e "$rodir/big.bin.part" ]] || fail ".part leaked next to source"
+  [[ $rc -eq 0 ]] || { fail "expected resume to succeed on read-only source dir; rc=$rc out=$out"; return 1; }
+  grep -q "↻ Resuming at byte 262144" <<< "$out" \
+    || { fail "expected resume message — fresh upload happened instead: $out"; return 1; }
+  grep -q "Uploaded successfully" <<< "$out" || { fail "no success message: $out"; return 1; }
+  [[ ! -e "$rodir/big.bin.part" ]] || { fail ".part leaked next to source"; return 1; }
 }
 
 test_path_with_spaces() {
@@ -301,9 +307,8 @@ test_path_with_spaces() {
 
 test_identical_content_different_names() {
   # Two files with identical bytes at different upload paths must
-  # produce distinct uploads. Before Upload-Key was namespaced by the
-  # destination name, a content-deduping server would hand the second
-  # POST back the first upload's id, and the follow-up PATCH would 404.
+  # produce distinct uploads (Upload-Key is namespaced by destination
+  # name so content-deduping servers don't collide them).
   local root="$WORK_DIR/dupes"; local tdir="$WORK_DIR/dupes-cache"
   mkdir -p "$root/a" "$root/b"
   printf 'identical 39 bytes of fixture content..' > "$root/a/same.txt"
@@ -336,10 +341,9 @@ test_name_override() {
 }
 
 test_dir_per_file_success_and_cleanup() {
-  # Each file in dir mode must print its own "Uploaded successfully!"
-  # + URL — the EXIT trap is not inherited into `(subshell)` in bash,
-  # so reporting has to be explicit. Also verify no part.* tempfiles
-  # leak in $TUSDIR after a clean batch.
+  # Dir mode prints "Uploaded successfully!" + URL per file (bash
+  # doesn't inherit the EXIT trap into a subshell, so reporting is
+  # explicit). No part.* tempfiles in $TUSDIR after a clean batch.
   local root="$WORK_DIR/perfile"; local tdir="$WORK_DIR/perfile-cache"
   mkdir -p "$root/a"
   echo aaa > "$root/x.txt"
@@ -362,13 +366,10 @@ test_dir_per_file_success_and_cleanup() {
 }
 
 test_dir_set_e_honored_inside_subshell() {
-  # `( cmd ) || handler` disables set -e *inside* the subshell — plain
-  # command failures would continue past instead of aborting. The
-  # dir-mode driver must capture status without using ||, otherwise a
-  # transient failure mid-upload_one would silently keep running.
-  # We exercise this by pointing one of the children at an unreachable
-  # port: the connect failure must trip error() and the child must
-  # exit non-zero (not fall through and report success).
+  # Dir mode must not use `( cmd ) || handler` (that disables set -e
+  # inside the subshell). Point a child at an unreachable port and
+  # assert it exits non-zero with a "Request failed" — no fall-through
+  # to a fake success.
   local root="$WORK_DIR/seteset"; local tdir="$WORK_DIR/seteset-cache"
   mkdir -p "$root"
   echo aaa > "$root/x.txt"
@@ -384,9 +385,8 @@ test_dir_set_e_honored_inside_subshell() {
 }
 
 test_creds_file_requires_both_user_and_pass() {
-  # A creds file that sets only PASS must fail loudly — historically
-  # the script accepted that and fell back to the shell's ambient
-  # $USER, silently authenticating as the local account.
+  # A creds file that sets only PASS must fail loudly; we must not
+  # silently fall back to the shell's ambient $USER.
   local cf="$WORK_DIR/half-creds.sh"
   echo 'PASS="secret"' > "$cf"
   local out rc
@@ -397,9 +397,8 @@ test_creds_file_requires_both_user_and_pass() {
 }
 
 test_checksum_cache_invalidates_on_size_change() {
-  # Rewrite a file with mtime preserved but different size: the cache
-  # must NOT serve the old digest. Path+mtime alone (second-resolution)
-  # is not a strong enough key for "is the content unchanged?".
+  # Rewrite a file with mtime preserved but different size: cache key
+  # must include size so the new bytes get re-hashed.
   local f="$WORK_DIR/cache-size.bin"; local tdir="$WORK_DIR/cache-size-cache"
   mkdir -p "$tdir"
   printf 'AAAA' > "$f"
@@ -468,11 +467,9 @@ test_tusc_nocache_forces_rehash() {
 }
 
 test_force_sends_fresh_upload_key() {
-  # --force must send a different Upload-Key on POST so a server that
-  # dedupes on it creates a new upload instead of returning the old
-  # URL. We can't ask tusd to dedup, so we inspect the DEBUG trace and
-  # confirm the Upload-Key sent under --force differs from the one
-  # sent on the unforced run.
+  # --force must send a different Upload-Key on POST (otherwise a
+  # content-deduping server would hand back the old upload). Inspect
+  # DEBUG traces for the unforced vs forced POSTs and compare keys.
   local f="$WORK_DIR/forcekey.bin"; local tdir="$WORK_DIR/forcekey-cache"
   printf 'forcekey-content' > "$f"
   local out1 out2 k1 k2
@@ -501,43 +498,26 @@ test_locate_requires_host() {
     || { fail "expected --host required error; got: $out"; return 1; }
 }
 
-test_upload_key_includes_basepath() {
-  # Same file + same in-bucket name at two different --base-path
-  # destinations must produce different uploads. Pre-fix UPLOAD_KEY
-  # mixed only content + name, so a server that honors Upload-Key for
-  # dedup would have collided across base-paths.
-  local f="$WORK_DIR/bp.bin"; local tdir="$WORK_DIR/bp-cache"
+test_upload_key_includes_destination() {
+  # UPLOAD_KEY must hash content + host + base-path + name. Assert the
+  # key changes when only the host changes and when only the base-path
+  # changes.
+  local f="$WORK_DIR/bp.bin"
   printf 'shared bytes' > "$f"
-
-  # Server only has one base-path mounted (/files/), but the cache
-  # behaviour is what we're after — distinct UPLOAD_KEYs mean
-  # distinct cache-loc entries. Run with two different --base-path
-  # values pointing at the same tusd, and verify two distinct
-  # cache-loc files appear in $TUSDIR.
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C >/dev/null \
-    || { fail "first upload failed"; return 1; }
-  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -b /files/ -f "$f" -a sha256 -S -C >/dev/null \
-    || { fail "second upload failed"; return 1; }
-  # Now switch base-path to /files/sub/ — tusd doesn't actually serve
-  # that, but the cache-loc filename derivation runs before any POST.
-  # Force a fresh attempt to materialize the cache entry; expect it
-  # to fail at POST but the loc file should NOT have been written
-  # because cache-loc-set runs after a successful POST. Better: just
-  # check upload-key hashing by replicating what the script does.
-  local key
-  key=$(sha256 "$f")
-  local k1 k2
-  k1=$(printf '%s:%s:%s' "$key" "/files/" "bp.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
-  k2=$(printf '%s:%s:%s' "$key" "/other/" "bp.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
-  [[ "$k1" != "$k2" ]] || { fail "UPLOAD_KEY collided across base-paths"; return 1; }
+  local key; key=$(sha256 "$f")
+  local SUM='(command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk "{print \$1}"'
+  local same other_host other_base
+  same=$(printf '%s:%s:%s:%s' "$key" "h1" "/files/" "bp.bin" | eval "$SUM")
+  other_host=$(printf '%s:%s:%s:%s' "$key" "h2" "/files/" "bp.bin" | eval "$SUM")
+  other_base=$(printf '%s:%s:%s:%s' "$key" "h1" "/other/" "bp.bin" | eval "$SUM")
+  [[ "$same" != "$other_host" ]] || { fail "UPLOAD_KEY collided across hosts"; return 1; }
+  [[ "$same" != "$other_base" ]] || { fail "UPLOAD_KEY collided across base-paths"; return 1; }
 }
 
 test_dir_manifest_cleaned_on_interrupt() {
-  # The dir-mode manifest tempfile must be tracked globally so the
-  # EXIT trap removes it even when the script is interrupted before
-  # the normal cleanup line runs. We simulate interruption with a
-  # bad host so the very first per-file upload error()s out; check
-  # that no manifest.* leaks remain in $TUSDIR afterward.
+  # Manifest tempfile must be cleaned up by the EXIT trap even when
+  # the upload loop is interrupted. Force an early exit by pointing
+  # at an unreachable host and assert no manifest.* remains.
   local root="$WORK_DIR/manif"; local tdir="$WORK_DIR/manif-cache"
   mkdir -p "$root"
   echo aaa > "$root/x.txt"
@@ -549,7 +529,6 @@ test_dir_manifest_cleaned_on_interrupt() {
 
 test_invalid_algo_rejected() {
   # Algorithm whitelist: only sha1/sha224/sha256/sha384/sha512.
-  # `sha999` used to slip past the loose `sha*` prefix check.
   local f="$WORK_DIR/algo.bin"
   printf x > "$f"
   local out rc
@@ -562,8 +541,6 @@ test_invalid_algo_rejected() {
 test_dir_forwards_curl_passthrough() {
   # Curl passthrough args (everything after `--`) must reach the
   # per-file curl invocation in dir mode, not just single-file mode.
-  # Pre-refactor the dir-mode re-exec dropped CURLARGS entirely, so
-  # `-d -- -H "X-Foo: bar"` silently lost the X-Foo header.
   local root="$WORK_DIR/dirfwd"; local tdir="$WORK_DIR/dirfwd-cache"
   mkdir -p "$root"
   echo aaa > "$root/x.txt"
@@ -582,14 +559,11 @@ test_dir_forwards_curl_passthrough() {
 }
 
 test_env_var_credentials() {
-  # TUSC_USER + TUSC_PASS in the env should populate the basic-auth
-  # header just like --creds <file> does.
+  # TUSC_USER + TUSC_PASS in the env populate basic auth without a
+  # file. Verify by greppin the masked --user line out of DEBUG output.
   local f="$WORK_DIR/auth.bin"; local tdir="$WORK_DIR/auth-cache"
   dd if=/dev/urandom of="$f" bs=1024 count=16 2>/dev/null
   local out
-  # DEBUG=1 prints the curl invocation with the password masked as
-  # `***`; presence of `--user 'alice:***'` confirms the env creds
-  # were picked up and threaded into curl's argv.
   out=$(TUSDIR="$tdir" TUSC_USER=alice TUSC_PASS=secret DEBUG=1 \
         tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -S -C 2>&1) \
     || { fail "env-auth upload failed: $out"; return 1; }
@@ -628,7 +602,7 @@ test_resume_announces_offset() {
   # Seed the cache. UPLOAD_KEY = SUMALGO of "<content>:<basepath>:<name>".
   local key; key=$(sha256 "$f")
   local upload_key
-  upload_key=$(printf '%s:%s:%s' "$key" "/files/" "resume.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
+  upload_key=$(printf '%s:%s:%s:%s' "$key" "$TUSD_HOST:$TUSD_PORT" "/files/" "resume.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
   local hostsha
   hostsha=$(printf %s "$TUSD_HOST:$TUSD_PORT/files/" \
     | (command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum -a 1) \
@@ -705,7 +679,7 @@ test_head_5xx_surfaces_error() {
   # Seed cache: UPLOAD_KEY = sha256("<content>:<basepath>:<name>").
   local key; key=$(sha256 "$WORK_DIR/head500.bin")
   local upload_key
-  upload_key=$(printf '%s:%s:%s' "$key" "/files/" "head500.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
+  upload_key=$(printf '%s:%s:%s:%s' "$key" "127.0.0.1:$port" "/files/" "head500.bin" | (command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256) | awk '{print $1}')
   local hostsha
   hostsha=$(printf %s "127.0.0.1:$port/files/" \
     | (command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum -a 1) \
@@ -757,7 +731,7 @@ run "checksum cache invalidates on same-second rewrite"    test_checksum_cache_i
 run "TUSC_NOCACHE bypasses the checksum cache"             test_tusc_nocache_forces_rehash
 run "--force sends a fresh Upload-Key on POST"             test_force_sends_fresh_upload_key
 run "--locate requires --host"                             test_locate_requires_host
-run "UPLOAD_KEY includes BASEPATH (no cross-bucket collide)" test_upload_key_includes_basepath
+run "UPLOAD_KEY differs across host and base-path"          test_upload_key_includes_destination
 run "-d manifest is cleaned up even on interrupt"          test_dir_manifest_cleaned_on_interrupt
 run "invalid --algo is rejected by whitelist"              test_invalid_algo_rejected
 run "TUSC_USER/TUSC_PASS env creds are honored" test_env_var_credentials
