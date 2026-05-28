@@ -480,6 +480,85 @@ test_name_override() {
   [[ $found -eq 1 ]] || fail "Upload-Metadata.filename did not honor --name override"
 }
 
+# Helper for the --remote-path tests: assert that some upload's
+# Upload-Metadata.filename equals the expected literal string.
+assert_filename_uploaded() { # $1 = expected filename
+  local expected="$1" info
+  for info in "$UPLOAD_DIR"/*.info; do
+    grep -q "\"filename\":\"$expected\"" "$info" && return 0
+  done
+  return 1
+}
+
+test_remote_path_single_file() {
+  # --remote-path X uploads the file under X/ as a destination
+  # directory; the source basename (or -N override) is appended.
+  local f="$WORK_DIR/rp-single.bin"; local tdir="$WORK_DIR/rp-single-cache"
+  dd if=/dev/urandom of="$f" bs=1024 count=8 2>/dev/null
+  rm -rf "$UPLOAD_DIR"; mkdir -p "$UPLOAD_DIR"
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C \
+    --remote-path "videos/2024" >/dev/null \
+    || { fail "single-file upload with --remote-path failed"; return 1; }
+  assert_filename_uploaded "videos/2024/rp-single.bin" \
+    || { fail "expected filename videos/2024/rp-single.bin in upload metadata"; return 1; }
+}
+
+test_remote_path_composes_with_name_override() {
+  # --remote-path + -N: PATH is the directory, -N replaces the basename.
+  local f="$WORK_DIR/rp-named.bin"; local tdir="$WORK_DIR/rp-named-cache"
+  dd if=/dev/urandom of="$f" bs=1024 count=4 2>/dev/null
+  rm -rf "$UPLOAD_DIR"; mkdir -p "$UPLOAD_DIR"
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C \
+    -N "sub/renamed.bin" --remote-path "uploads" >/dev/null \
+    || { fail "upload with --remote-path + -N failed"; return 1; }
+  assert_filename_uploaded "uploads/sub/renamed.bin" \
+    || { fail "expected uploads/sub/renamed.bin"; return 1; }
+}
+
+test_remote_path_dir_mode() {
+  # --remote-path + -d: source basename and structure preserved
+  # under the prefix.
+  local root="$WORK_DIR/rp-dir"; local tdir="$WORK_DIR/rp-dir-cache"
+  mkdir -p "$root/sub"
+  echo aaa > "$root/top.txt"
+  echo bbb > "$root/sub/inner.txt"
+  rm -rf "$UPLOAD_DIR"; mkdir -p "$UPLOAD_DIR"
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -d -f "$root" -a sha256 -C \
+    --remote-path "remote/place" >/dev/null \
+    || { fail "dir upload with --remote-path failed"; return 1; }
+  assert_filename_uploaded "remote/place/rp-dir/top.txt" \
+    || { fail "expected remote/place/rp-dir/top.txt"; return 1; }
+  assert_filename_uploaded "remote/place/rp-dir/sub/inner.txt" \
+    || { fail "expected remote/place/rp-dir/sub/inner.txt"; return 1; }
+}
+
+test_remote_path_normalizes_slashes() {
+  # Leading and trailing slashes are stripped; "/foo/bar/" == "foo/bar".
+  local f="$WORK_DIR/rp-norm.bin"; local tdir="$WORK_DIR/rp-norm-cache"
+  printf x > "$f"
+  rm -rf "$UPLOAD_DIR"; mkdir -p "$UPLOAD_DIR"
+  TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C \
+    --remote-path "///wrapped/path///" >/dev/null \
+    || { fail "upload with slash-wrapped --remote-path failed"; return 1; }
+  assert_filename_uploaded "wrapped/path/rp-norm.bin" \
+    || { fail "expected wrapped/path/rp-norm.bin (slashes should be stripped)"; return 1; }
+}
+
+test_remote_path_only_slashes_rejected() {
+  # Empty after normalization (e.g. "/" or "///") must error — caller
+  # most likely meant to pass a real path.
+  local f="$WORK_DIR/rp-empty.bin"; local tdir="$WORK_DIR/rp-empty-cache"
+  printf x > "$f"
+  local out rc bad
+  for bad in "/" "///"; do
+    out=$(TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C \
+          --remote-path "$bad" 2>&1) && rc=0 || rc=$?
+    [[ $rc -ne 0 ]] || { fail "--remote-path '$bad' should be rejected; out: $out"; return 1; }
+    grep -q -- "--remote-path" <<< "$out" \
+      || { fail "expected --remote-path mention in error; got: $out"; return 1; }
+  done
+}
+
 test_dir_rerun_skips_completed_files() {
   # The user-reported scenario: re-running `--dir` against the same
   # source must short-circuit already-uploaded files via the done
@@ -1294,6 +1373,11 @@ run "resume works from read-only source directory" test_resume_from_readonly_sou
 run "path with spaces survives quoting"            test_path_with_spaces
 run "identical content at different paths uploads twice" test_identical_content_different_names
 run "-N override sets Upload-Metadata.filename" test_name_override
+run "--remote-path prefixes single-file uploads"            test_remote_path_single_file
+run "--remote-path composes with -N"                        test_remote_path_composes_with_name_override
+run "--remote-path prefixes -d (dir) uploads"               test_remote_path_dir_mode
+run "--remote-path strips leading/trailing slashes"         test_remote_path_normalizes_slashes
+run "--remote-path of only slashes is rejected"             test_remote_path_only_slashes_rejected
 run "-d re-run skips already-completed files"             test_dir_rerun_skips_completed_files
 run "-d prints per-file success + URL; no tempfile leak"  test_dir_per_file_success_and_cleanup
 run "-d honors set -e inside the per-file subshell"       test_dir_set_e_honored_inside_subshell

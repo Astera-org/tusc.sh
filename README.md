@@ -120,6 +120,10 @@ rm -rf "${TMPDIR:-/tmp}/tusc.$(id -u)"
                    survive flaky LBs and idle-timeouts better.
     -N --name      Override the filename sent in Upload-Metadata.
                    (May contain slashes; server gets the literal value.)
+       --remote-path PATH  Destination directory prefix for Upload-Metadata.filename.
+                   Composes with -N and -d; the source basename / -N value /
+                   dir-mode relpath is appended under PATH. Leading and
+                   trailing slashes are stripped (e.g. videos/2024).
     -d --dir       Treat --file as a directory; upload every file under it,
                    preserving the relative path in Upload-Metadata.filename.
     -h --help      Show help information and usage.

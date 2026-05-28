@@ -221,7 +221,7 @@ comment() { line "$1" 30 1 "$2"; }      # dim,  stdout (used to render --help te
 debug()   { line "$1" 30 1 "$2" 2; }    # dim,  stderr (DEBUG=1 trace lines)
 
 # show version
-version() { echo v2.0.0; }
+version() { echo v2.1.0; }
 
 # update tusc
 update()
@@ -277,6 +277,10 @@ usage()
                    $(comment "survive flaky LBs and idle-timeouts better.")
     $(info "-N --name")      $(comment "Override the filename sent in Upload-Metadata.")
                    $(comment "(May contain slashes; server gets the literal value.)")
+    $(info "   --remote-path PATH") $(comment "Destination directory prefix for Upload-Metadata.filename.")
+                   $(comment "Composes with -N and -d; the source basename / -N value /")
+                   $(comment "dir-mode relpath is appended under PATH. Leading and")
+                   $(comment "trailing slashes are stripped (e.g. videos/2024).")
     $(info "-d --dir")       $(comment "Treat --file as a directory; upload every file under it,")
                    $(comment "preserving the relative path in Upload-Metadata.filename.")
     $(info "-h --help")      $(comment "Show help information and usage.")
@@ -570,6 +574,7 @@ while [[ $# -gt 0 ]]; do
     -N | --name) NAME_OVERRIDE="$2"; shift 2 ;;
     --retries) RETRIES="$2"; shift 2 ;;
     --chunk-size) CHUNK_SIZE_RAW="$2"; shift 2 ;;
+    --remote-path) REMOTE_PATH="$2"; shift 2 ;;
     -u | --update) update; exit 0 ;;
          --version | version) version; exit 0 ;;
     --) shift; CURLARGS=("$@"); break ;;
@@ -615,6 +620,17 @@ case "$SUMALGO" in
 esac
 
 BASEPATH=${BASEPATH:-/files/}
+
+# --remote-path PATH: optional destination-directory prefix applied to
+# Upload-Metadata.filename. Treated as a directory (scp/rsync style) —
+# the source basename (or -N override, or dir-mode relpath) is appended
+# under it. Strip leading and trailing slashes once here so the rest of
+# the code can just compose `$REMOTE_PATH/$NAME` without re-normalizing.
+if [[ -n "${REMOTE_PATH:-}" ]]; then
+  while [[ "$REMOTE_PATH" == /* ]]; do REMOTE_PATH="${REMOTE_PATH#/}"; done
+  while [[ "$REMOTE_PATH" == */ ]]; do REMOTE_PATH="${REMOTE_PATH%/}"; done
+  [[ -n "$REMOTE_PATH" ]] || error "--remote-path is empty (only slashes?)" 1
+fi
 
 # Per-file upload body. Success paths call report_success inline;
 # the EXIT trap handles cleanup and the interrupted-resume hint.
@@ -919,6 +935,7 @@ if [[ $DIRMODE ]]; then
   while IFS= read -r -d '' f; do
     idx=$((idx+1))
     rel="$ROOT_NAME/${f#$ROOT/}"
+    [[ -n "$REMOTE_PATH" ]] && rel="$REMOTE_PATH/$rel"
     info "[$idx/$total] $rel"
     set +e
     ( set -e; trap on-exit EXIT; upload_one "$f" "$rel" )
@@ -932,4 +949,6 @@ if [[ $DIRMODE ]]; then
   exit 0
 fi
 
-upload_one "$FILE" "${NAME_OVERRIDE:-$(basename "$FILE")}"
+NAME="${NAME_OVERRIDE:-$(basename "$FILE")}"
+[[ -n "$REMOTE_PATH" ]] && NAME="$REMOTE_PATH/$NAME"
+upload_one "$FILE" "$NAME"
