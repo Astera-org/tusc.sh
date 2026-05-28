@@ -731,6 +731,60 @@ test_debug_drops_curl_v_when_auth_present() {
     || { fail "TUSC_DEBUG_UNSAFE=1 should re-enable curl -v; got: $out"; return 1; }
 }
 
+test_relative_location_after_redirect_uses_effective_url() {
+  # POST /files/ -> 307 /v2/files/ ; final 201 returns
+  # Location: uploads/REL-ID (path-relative, no leading slash).
+  # Resolution base must be the post-redirect /v2/files/, not the
+  # original /files/, so the cached URL contains /v2/files/uploads/.
+  command -v python3 >/dev/null || { say "    skip: python3 not available"; return 0; }
+  local port=$((40000 + RANDOM % 10000))
+  cat > "$WORK_DIR/redir-rel-stub.py" <<PY
+import http.server, socketserver, sys
+PORT = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path == "/files/":
+            self.send_response(307)
+            self.send_header("Location", "http://127.0.0.1:%d/v2/files/" % PORT)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(201)
+        self.send_header("Tus-Resumable", "1.0.0")
+        # Path-relative final Location: must resolve against /v2/files/.
+        self.send_header("Location", "uploads/REL-ID")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def do_PATCH(self):
+        body_len = int(self.headers.get("Content-Length", "0"))
+        if body_len: self.rfile.read(body_len)
+        self.send_response(204)
+        self.send_header("Tus-Resumable", "1.0.0")
+        self.send_header("Upload-Offset", str(body_len))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a, **k): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", PORT), H) as s:
+    s.serve_forever()
+PY
+  python3 "$WORK_DIR/redir-rel-stub.py" "$port" >/dev/null 2>&1 &
+  STUB_PID=$!
+  for _ in $(seq 1 50); do
+    curl -sS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
+    sleep 0.05
+  done
+
+  local f="$WORK_DIR/redir-rel.bin"; local tdir="$WORK_DIR/redir-rel-cache"
+  printf 'redir-relative' > "$f"
+  TUSDIR="$tdir" tusc -H "127.0.0.1:$port" -f "$f" -a sha256 -S -C >/dev/null 2>&1 || true
+  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+
+  local cached; cached=$(cat "$tdir"/loc.* 2>/dev/null | head -1)
+  [[ "$cached" == "http://127.0.0.1:$port/v2/files/uploads/REL-ID" ]] \
+    || { fail "expected post-redirect resolution; got: $cached"; return 1; }
+}
+
 test_header_returns_final_response_after_redirect() {
   # When the server 302s the POST to a different URL that then returns
   # the real Location, header() must report the *final* response's
@@ -979,6 +1033,7 @@ run "path-relative Location resolves against POST URL dir" test_path_relative_lo
 run "POST that returns no Location errors out"             test_post_with_no_location_errors
 run "DEBUG drops curl -v when auth creds are in use"       test_debug_drops_curl_v_when_auth_present
 run "header() returns final response Location after redirect" test_header_returns_final_response_after_redirect
+run "relative Location after redirect uses effective URL"    test_relative_location_after_redirect_uses_effective_url
 run "DEBUG masks passwords with shell metacharacters"      test_debug_masks_password_with_metacharacters
 run "TUSC_USER/TUSC_PASS env creds are honored" test_env_var_credentials
 run "resume announces byte offset"     test_resume_announces_offset

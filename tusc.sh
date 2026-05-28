@@ -94,17 +94,13 @@ body-checksum-b64() # $1 = algo, $2 = file (the actual PATCH body)
   openssl dgst "-$1" -binary "$2" 2>/dev/null | base64 | tr -d '\n'
 }
 
-# Resolve a TUS Location header against the POST URL per RFC 3986:
-#   absolute (http://...) — return as-is
-#   protocol-relative (//host/p) — prefix scheme from base
-#   absolute-path (/p) — combine with scheme+authority of base
-#   path-relative (p) — combine with base's directory (up to the
-#                       last "/", inclusive)
-# Note: redirect chains are not tracked here — the base is the
-# original POST URL ($HOST$BASEPATH). Servers should prefer absolute
-# Location values; relative resolution after a redirect is a known
-# limitation of this approach.
-resolve_url() # $1 = base URL (POST target), $2 = Location reference
+# Resolve a TUS Location header against a base URL. Handles the four
+# common reference forms (absolute, protocol-relative, absolute-path,
+# path-relative) — does NOT do RFC-3986 dot-segment normalization
+# ("../" / "./" stay literal in the output). Callers pass the
+# effective POST URL (curl's %{url_effective}, which already reflects
+# any -L redirects) so relative resolution sees the right base.
+resolve_url() # $1 = base URL, $2 = Location reference
 {
   local base=$1 ref=$2
   case "$ref" in
@@ -121,16 +117,18 @@ resolve_url() # $1 = base URL (POST target), $2 = Location reference
     //*) printf '%s%s\n' "$scheme" "$ref"; return ;;
   esac
   local sch_auth=""
+  # `[^/]+` after the scheme handles bracketed IPv6 hosts
+  # (`http://[::1]:1080/`) since `]` is a valid bracket-expression
+  # char, not a delimiter for us.
   [[ "$base" =~ ^(https?://[^/]+) ]] && sch_auth="${BASH_REMATCH[1]}"
   case "$ref" in
     /*) printf '%s%s\n' "$sch_auth" "$ref"; return ;;
   esac
-  # Path-relative: combine with base's directory portion.
-  local base_path="${base#${sch_auth}}"
-  # Strip query/fragment if any so base_path is just the path.
+  # Path-relative: combine with base's directory portion. Strip the
+  # scheme+authority by length (not by glob pattern — `[`/`]` in IPv6
+  # hosts confuses ${var#pattern}).
+  local base_path="${base:${#sch_auth}}"
   base_path="${base_path%%[?#]*}"
-  # Keep up to the last "/" (inclusive). If base has no "/" after
-  # the authority, treat the path as "/".
   case "$base_path" in
     */*) base_path="${base_path%/*}/" ;;
     *)   base_path="/" ;;
@@ -344,6 +342,12 @@ request()
   fi
   cmd+=(-L -D "$HEADER" -H "Tus-Resumable: 1.0.0")
   [[ $HAS_AUTH ]] && cmd+=(--basic --user "$CRED_USER:$CRED_PASS")
+  # Append %{url_effective} to stdout so we can resolve a relative
+  # Location against the post-redirect URL, not the original target.
+  # Wrapped in markers so we can pull it back out without confusing
+  # it for response body bytes.
+  local URL_MARK="__TUSC_URL_EFFECTIVE_3f4d29__"
+  cmd+=(-w "${URL_MARK}%{url_effective}${URL_MARK}")
   # CURLARGS is a user-supplied passthrough captured as an array from
   # the "--" sentinel during argv parsing. Safe to splat directly.
   [[ ${#CURLARGS[@]} -gt 0 ]] && cmd+=("${CURLARGS[@]}")
@@ -379,6 +383,14 @@ request()
     BODY=$("${cmd[@]}" 2>&1)
   fi
   set -e
+
+  # Pull %{url_effective} (and its markers) back out of BODY.
+  EFFECTIVE_URL=""
+  if [[ "$BODY" == *"$URL_MARK"*"$URL_MARK"* ]]; then
+    EFFECTIVE_URL=${BODY#*$URL_MARK}
+    EFFECTIVE_URL=${EFFECTIVE_URL%%$URL_MARK*}
+    BODY=${BODY%%$URL_MARK*}
+  fi
 
   STATUS=$(awk '/^HTTP\// { match($0, /[0-9][0-9][0-9]/); s = substr($0,RSTART,3) } END { print s }' "$HEADER")
   if [[ "$STATUS" == 20* ]]; then ISOK=1 RET=0; else ISOK=0 RET=1; fi
@@ -650,7 +662,10 @@ upload_one() # $1 = absolute file path, $2 = name for Upload-Metadata.filename
 
     TUSURL=$(header "Location")
     [[ -n "$TUSURL" ]] || error "POST returned 2xx but no Location header" 1
-    TUSURL=$(resolve_url "$HOST$BASEPATH" "$TUSURL")
+    # Resolve relative Location against the POST's effective URL
+    # (post-redirect), falling back to $HOST$BASEPATH if curl didn't
+    # report one.
+    TUSURL=$(resolve_url "${EFFECTIVE_URL:-$HOST$BASEPATH}" "$TUSURL")
     cache-loc-set "$HOST$BASEPATH" "$UPLOAD_KEY" "$TUSURL"
 
     # 0-byte file: POST already finalized the upload. Don't send an
