@@ -22,10 +22,25 @@ UPLOAD_DIR="$WORK_DIR/uploads"
 mkdir -p "$UPLOAD_DIR"
 
 case "$(uname -s)" in
-  Linux)  TUSD_OS=linux;  TUSD_EXT=tar.gz ;;
-  Darwin) TUSD_OS=darwin; TUSD_EXT=zip ;;
+  Linux)  TUSD_OS=linux;  TUSD_EXT=tar.gz; IS_BSD=0 ;;
+  Darwin) TUSD_OS=darwin; TUSD_EXT=zip;    IS_BSD=1 ;;
   *) echo "unsupported OS: $(uname -s)" >&2; exit 1 ;;
 esac
+
+# GNU vs BSD splits for `stat`/`touch`. Probing via `stat -f %m` is
+# unsafe — GNU stat reads -f as --file-system and prints filesystem
+# stats to stdout (with non-zero exit), which contaminates a captured
+# mtime if used in command substitution.
+fmtime() {  # unix timestamp of $1
+  if [[ $IS_BSD -eq 1 ]]; then stat -f %m "$1"; else stat -c %Y "$1"; fi
+}
+set_mtime() {  # $1 = unix-ts, $2 = file
+  if [[ $IS_BSD -eq 1 ]]; then
+    touch -t "$(date -r "$1" +%Y%m%d%H%M.%S)" "$2"
+  else
+    touch -d "@$1" "$2"
+  fi
+}
 case "$(uname -m)" in
   x86_64|amd64) TUSD_ARCH=amd64 ;;
   aarch64|arm64) TUSD_ARCH=arm64 ;;
@@ -563,16 +578,12 @@ test_checksum_cache_invalidates_on_size_change() {
   local f="$WORK_DIR/cache-size.bin"; local tdir="$WORK_DIR/cache-size-cache"
   mkdir -p "$tdir"
   printf 'AAAA' > "$f"
-  local mt; mt=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")
+  local mt; mt=$(fmtime "$f")
   TUSDIR="$tdir" tusc -H "$TUSD_HOST:$TUSD_PORT" -f "$f" -a sha256 -C >/dev/null
   # Rewrite with different content + size; restore the original mtime
   # (some editors do this; `cp -p`, `tar -p`, `touch -r` all preserve).
   printf 'BBBBBBBB' > "$f"
-  if stat -f %m "$f" >/dev/null 2>&1; then
-    touch -t "$(date -r "$mt" +%Y%m%d%H%M.%S)" "$f"
-  else
-    touch -d "@$mt" "$f"
-  fi
+  set_mtime "$mt" "$f"
   # Now re-run. If the cache short-circuited and reused the stale
   # digest, this run would post under the old upload (wrong KEY ->
   # wrong UPLOAD_KEY -> wrong server-side identity). With the fix, the
